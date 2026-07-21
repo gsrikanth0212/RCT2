@@ -1,0 +1,106 @@
+{
+  "summary": {
+    "workbook_name": "sales_dashboard_no_conn",
+    "total_calculations": 0,
+    "by_status": {
+      "SUCCESS": 0,
+      "PARTIAL": 0,
+      "FALLBACK": 0,
+      "UNSUPPORTED": 0,
+      "FAILED": 0
+    },
+    "by_semantic_class": {},
+    "total_measures": 0,
+    "total_lod_calculations": 0,
+    "total_table_calculations": 0,
+    "potential_visual_issues": 0,
+    "potential_accuracy_risks": 0,
+    "overall_confidence_score": 100,
+    "function_inventory": {},
+    "impacted_visual_names": [],
+    "accuracy_risk_visuals": [],
+    "failed_by_empty_formula": 0,
+    "failed_by_translator": 0,
+    "failed_by_col_ref_fix": 0,
+    "failed_by_agg_fix": 0,
+    "failed_by_reuse_cache": 0,
+    "failed_by_cycle": 0,
+    "failed_by_dependency": 0,
+    "failed_by_post_processing": 0,
+    "worksheet_scores": [
+      {
+        "worksheet": "sales_by_region",
+        "detected_visual": "Bar",
+        "pbi_visual": "clusteredColumnChart",
+        "calc_pct": 100,
+        "visual_pct": 95,
+        "layout_pct": 100,
+        "format_pct": 87,
+        "filter_pct": 100,
+        "overall_pct": 97,
+        "notes": []
+      },
+      {
+        "worksheet": "sales_by_year",
+        "detected_visual": "Automatic",
+        "pbi_visual": "clusteredColumnChart",
+        "calc_pct": 100,
+        "visual_pct": 95,
+        "layout_pct": 100,
+        "format_pct": 80,
+        "filter_pct": 100,
+        "overall_pct": 96,
+        "notes": []
+      }
+    ],
+    "avg_overall_match_pct": 96,
+    "dashboard_actions": [],
+    "parameter_notes": [],
+    "story_notes": [],
+    "data_model_tables": [
+      "superstore_data",
+      "People",
+      "Returns"
+    ],
+    "data_model_relationships": [
+      {
+        "name": "superstore_data_Region_People_Region",
+        "fromTable": "superstore_data",
+        "fromColumn": "Region",
+        "toTable": "People",
+        "toColumn": "Region",
+        "fromCardinality": "many",
+        "toCardinality": "one",
+        "crossFilteringBehavior": "oneDirection",
+        "joinOnDateBehavior": "datePartOnly",
+        "isActive": true
+      },
+      {
+        "name": "superstore_data_Order ID_Returns_Order ID",
+        "fromTable": "superstore_data",
+        "fromColumn": "Order ID",
+        "toTable": "Returns",
+        "toColumn": "Order ID",
+        "fromCardinality": "many",
+        "toCardinality": "one",
+        "crossFilteringBehavior": "oneDirection",
+        "joinOnDateBehavior": "datePartOnly",
+        "isActive": true
+      }
+    ],
+    "data_model_notes": [
+      [
+        "superstore_data.Region -> People.Region",
+        "created",
+        "cardinality many:one (dimension key confirmed unique; fact key confirmed non-unique)"
+      ],
+      [
+        "superstore_data.Order ID -> Returns.Order ID",
+        "created",
+        "cardinality many:one (dimension key confirmed unique; fact key confirmed non-unique)"
+      ]
+    ],
+    "datasource_notes": []
+  },
+  "records": []
+}
