@@ -3222,3 +3222,316 @@ Desktop into `input/` during this session. Not created or modified by any
 tool call this session — left as-is; the fixture-count references above
 (12, not 11) reflect this new state, re-verify with `ls input/ source/`
 rather than trusting "11" in earlier increments' text.
+
+---
+
+### Increment 32 — Datasource resolution, canonical column mapping & relationship-cardinality hardening (user-directed)
+
+New session. The user's `continue_enhancement_prompt.md` named three
+specific fixture failures and asked for root-cause fixes, not workbook-
+specific patches: `sales_dashboard.twbx` (embedded Excel, placeholder
+`C:\path\to\...` path in the generated M query), `sales_dashboard_new.twb`
+(standalone, "The column 'Regional Manager' of the table wasn't found"),
+and `sales_dashboard_no_conn.twbx` (embedded Hyper extract, DAX Number-vs-
+Text errors and duplicate-value errors on the "one" side of a many-to-one
+relationship). `Finance Dashboard_v2026.1.twbx` was named as the known-good
+regression fixture to diff against. All three failures were reproduced and
+root-caused against the real fixtures (not guessed) before any fix — each
+turned out to be a genuine, previously-undiscovered bug in shared, generic
+code paths, not three unrelated issues:
+
+**Root cause 1 (`sales_dashboard.twbx`, placeholder path)**: `extract_twbx_data`
+only ever extracted embedded `.csv` and `.hyper` files from a `.twbx`
+package — there was no code path for an embedded `.xlsx`/`.xls`/`.xlsm`
+file at all. `sales_dashboard.twbx` embeds
+`Data/Data Sources/sample_super_store.xlsx` (confirmed via direct zip
+inspection: 3 sheets, Orders/People/Returns, matching the datasource's own
+`<relation type="table" table="[Orders$]">` etc.), so `has_data` stayed
+`False` for it, `embed_sample_data` never activated, and
+`_resolve_literal_file_path` fell through to its documented placeholder-path
+fallback (`Data/Data Sources/sample_super_store.xlsx` is a package-relative
+path — not absolute by `_is_abs`'s own Windows/Unix check — and no
+`directory` was available to make it absolute), reproducing the exact
+reported `C:\path\to\sample_super_store.xlsx` error.
+
+**Root cause 2 (`sales_dashboard_no_conn.twbx`, DAX/cardinality errors)**:
+two independent bugs compounded. First, `_extract_hyper_schema` located the
+embedded `.hyper` file's JSON catalog and `return`ed on the FIRST
+`type='block'` relation found — silently discarding every other table in a
+multi-table extract. Direct inspection of this fixture's
+`superstore_data.hyper` (crude JSON-catalog scan, no SDK) showed the SAME
+single `.hyper` file actually contains THREE real tables —
+`Orders_<hash>`/`People_<hash>`/`Returns_<hash>`, with hash suffixes that
+are the exact same object-graph relationship endpoint IDs
+(`<first-end-point object-id="Orders_0284213D...">` etc.) — so `People`'s
+and `Returns`' row data was never even attempted, regardless of whether an
+extraction SDK was available. Second, `tableauhyperapi` (already
+auto-installed by the pre-existing `_ensure_hyper_libs()`, confirmed by
+running it fresh: `pip install tableauhyperapi` pulls a real 86 MB
+manylinux wheel cleanly) was never actually being asked for `People`/
+`Returns` data because of bug one — meaning even when Tier-1 SDK extraction
+was available, the single-table extraction bug prevented it from ever being
+invoked for the dimension tables. Querying the real Hyper catalog directly
+via `tableauhyperapi` (`SELECT * FROM "Extract"."People_..."` etc.) showed
+the REAL data has **zero** duplicate values (People: 4 unique regions;
+Returns: 296 unique Order IDs) — confirming the duplicate-value errors the
+user saw came from the codebase's Tier-2/3 *synthetic* fallback data
+(cycling a small seed pool across an estimated row count) being silently
+used as if it were real, not from the real Tableau extract. Separately, the
+existing relationship-cardinality code (Increment 22) always hardcoded
+`fromCardinality: "many"`/`toCardinality: "one"` and only used the sample-
+uniqueness check as a non-blocking audit *note* — it never prevented an
+invalid cardinality from being written even when real data (once actually
+extracted) proved the "one" side non-unique.
+
+**Root cause 3 (`sales_dashboard_new.twb`, "Regional Manager" not found)**:
+this fixture has NO `<object-graph><relationships>` block at all — it uses
+the older `<relation type='collection'>` physical style (Orders/People/
+Returns as flat `type='table'` sub-relations) plus a `<cols>` map assigning
+every field to its owning physical table. Increment 22's dimension-table
+splitting only ever fires for datasources with real `<object-graph>`
+relationships, so this datasource fell straight through to the single-
+flat-table path. Meanwhile, `parse_tableau_workbook`'s Pass 2 column
+collection (`ds.findall('.//column')`, recursive) picks up nested
+`<relation><columns><column>` elements — which describe each joined
+sub-table's own raw physical sheet layout, NOT Tableau logical field
+definitions — indiscriminately, regardless of which table the datasource's
+actual M query reads from. Since the flat table's M query only ever reads
+ONE physical sheet (`Orders`, chosen as the first sub-relation), every
+People-only or Returns-only physical column (`Regional Manager`, `Returned`)
+leaked into the flat table's declared TOM columns despite being
+unproducible by its own M query — exactly Power BI's "The column '...' of
+the table wasn't found" error. (The SAME leak exists on every other
+multi-sub-table fixture too, e.g. Amazon Sales Insights — confirmed via
+direct XML inspection — but happens to fail silently there instead of
+erroring, because that fixture's `embed_sample_data` path emits `null` for
+any declared column absent from a row dict rather than raising.)
+
+**Fixes implemented** (`tableau_pbi_server.py`), all generic and
+metadata-driven — no workbook/table/field names hardcoded:
+
+1. **`extract_twbx_data`, new Step 1b**: extracts embedded `.xlsx`/`.xls`/
+   `.xlsm` files via `openpyxl` (already an existing dependency), keyed per
+   real sheet name (matching each datasource's own
+   `<relation type="table" name="...">`), with a size-based alias under the
+   outer datasource caption so the flat/fact table's own embed lookup (keyed
+   by Tableau datasource caption, not sheet name) still resolves. Once any
+   embedded data is found, the existing `embed_sample_data` auto-activation
+   (already in `write_pbit`) takes over and the file-path-parameter/
+   placeholder-path branch is never reached.
+2. **New `_extract_hyper_schemas`** (plural): returns EVERY real `type='block'`
+   table relation in a `.hyper` file's JSON catalog, not just the first;
+   `_extract_hyper_schema` (singular) is now a thin backward-compatible
+   wrapper. `extract_twbx_data`'s Step 2 rewritten to extract every table
+   found this way — keyed by its hash-suffix-stripped clean name (e.g.
+   `People_F408B2A4...` → `People`) for dimension-table/uniqueness lookups,
+   plus the same largest-table caption alias as Step 1b. `_extract_hyper_rows`
+   itself (the existing 3-tier SDK/binary/synthetic extractor) was not
+   touched — it already accepted an explicit per-table schema/name; it just
+   was never being asked for anything beyond the first table before now.
+3. **New `_infer_relationships_from_cols_map`**: for a datasource with no
+   `<object-graph>` relationships but a `<relation type='collection'>` +
+   `<cols>` map, infers the same relationship shape
+   (`fromTable`/`fromColumn`/`toTable`/`toColumn`) from Tableau's own
+   disambiguation-suffix convention already trusted elsewhere in this
+   codebase (`_strip_dim_disambig_suffix`) — a field `'X (Table)'` mapped to
+   `[Table].[Col]` is the join partner of the bare `'X'` mapped to the
+   majority/fact table. Wired as a fallback in the existing `_ds_relationships`
+   loop (only fires when the `<object-graph>` scan found nothing), so every
+   downstream consumer (`_ds_dim_table_info`, `_build_dimension_table`, the
+   relationship-emission loop) works unchanged regardless of which Tableau
+   XML shape the relationship was discovered in — zero duplicated logic,
+   per the master spec's "one shared implementation" rule. This gives
+   `sales_dashboard_new.twb` real People/Returns dimension tables +
+   relationships for the first time.
+4. **Column provenance tag + fact-table leak filter**: `_add_column` now
+   tags every column with `_worksheet_used` (is this field's bracketed name
+   present in the pre-scanned worksheet `datasource-dependencies` registry,
+   i.e. genuinely dragged onto some shelf — as opposed to only being a raw
+   nested-schema descriptor Pass 2 happened to pick up). In the main per-
+   datasource table-building loop, a column whose `col_table`-declared owner
+   is a DIFFERENT real table than the datasource's own fact table is now
+   excluded from the flat/fact table's TOM columns — UNLESS it's a
+   relationship FK/PK column (needed for the join) or `_worksheet_used`
+   (left exactly as before, to avoid creating a NEW dangling *visual*
+   reference — see the important scoping note below). This is gated behind
+   `ds.get('_dim_split')`, so it is a no-op for any datasource without one
+   — zero behavioural change for the 6+ fixtures that never had this
+   problem. Verified end-to-end: `sales_dashboard_new.twb`'s flat table no
+   longer declares `Regional Manager` (was genuinely unused, real leak,
+   safe to drop); `Region (People)` (genuinely used by the `sales_by_region`
+   worksheet) is correctly left in place.
+5. **Relationship cardinality now checked on BOTH sides against real
+   extracted data**, not just the dimension side, and the result now
+   actually gates `fromCardinality`/`toCardinality`/`crossFilteringBehavior`
+   instead of only annotating an audit note that never changed behaviour:
+   dimension key confirmed unique → `many:one` (Tableau's own declared
+   convention, now *verified* rather than assumed); fact key confirmed
+   unique instead → `one:many` (swapped — real data contradicting Tableau's
+   convention is trusted over the declaration); dimension key confirmed
+   NON-unique (with or without fact-side confirmation) → `many:many` /
+   `bothDirections` (many:one would violate Power BI's one-side uniqueness
+   constraint and fail to load); both sides unknown (no extracted data at
+   all, e.g. a plain `.twb`) → the previous conservative `many:one` default,
+   still honestly labelled unverified in the audit note. `_sample_key_unique`
+   generalised to work for either side (was dimension-only) and now ignores
+   null/blank values when checking uniqueness (matching Power BI's own
+   constraint, which also ignores BLANK on the one side).
+6. **Datatype-compatibility gate**: before emitting a relationship, the
+   final PBI TOM `dataType` of both the FK and PK column is compared; a
+   mismatch (e.g. one side synthesized as `int64`, the other as `string`)
+   drops the relationship with a clear audit reason instead of emitting one
+   that would produce Power BI's "DAX comparison operations do not support
+   comparing values of type Number with values of type Text" — no
+   VALUE()/FORMAT() coercion attempted, per the master spec's explicit
+   instruction not to paper over a real schema mismatch. Not exercised by
+   any real or synthetic fixture this session (every real relationship's two
+   sides already agree once correctly typed) — flagged here rather than
+   claimed as fixture-verified.
+7. **Placeholder-path scan added to the existing data-model validation
+   pass**: after the existing dangling-relationship repair (Increment 22),
+   every table's M-query text is scanned for the placeholder marker; any
+   survivor is recorded as an audit warning (never silently shipped)
+   rather than failing the whole migration — matches the master spec's
+   Error-1 guidance to warn, not silently fabricate a path, when the real
+   source truly cannot be resolved.
+8. **Unrelated pre-existing bug fixed in passing**: `_HEATMAP_MARKS` was
+   referenced in a chart-type `elif` branch before its own definition
+   later in the same function — a real `NameError`
+   ("cannot access free variable '_HEATMAP_MARKS'... in enclosing scope")
+   that was crashing `input/sales_dashboard.twbx` (the tiny 12th/13th
+   fixture) end-to-end, unrelated to any datasource/relationship work this
+   session. Fixed by inlining the literal set at its point of use rather
+   than relying on a later definition in the same scope.
+
+**Verified**: `python3 -m py_compile` clean throughout. Ran the full
+`parse_tableau_workbook` → `build_data_model_schema` → `write_pbit()`
+pipeline (writing a real `.pbit`, then re-opening the zip and parsing the
+real UTF-16LE `DataModelSchema` JSON — not just the in-memory dict) against
+all 9 real fixtures now present across `source/` and `input/` (Amazon Sales
+Insights, Finance Dashboard, House Sales Dashboard, LocBar, Netfix
+Workbook, `source/`'s Finance Dashboard/sales_dashboard/
+sales_dashboard_new/sales_dashboard_no_conn, plus `input/sales_dashboard.twbx`
+once the unrelated `_HEATMAP_MARKS` bug above was fixed): **9/9 wrote a
+valid `.pbit` with zero exceptions**, zero placeholder paths anywhere in
+any generated M query, and — an independent check walking every visual's
+`Report/Layout` JSON and cross-referencing every `Column`/`Measure`
+`Entity`+`Property` reference against the real written table/column
+lists — **zero dangling visual field references in any of the 9**,
+including Amazon Sales Insights' 4 pre-existing relationships (unaffected:
+its `_dim_split` came from the `<object-graph>` path exactly as before, and
+none of its leaked columns turned out to be worksheet-used). Every
+relationship in every fixture (Amazon Sales Insights' 4, `sales_dashboard`/
+`sales_dashboard_new`/`sales_dashboard_no_conn`'s 2 each) independently
+re-verified to reference real tables/columns with no duplicate names.
+Cardinality on `sales_dashboard`/`sales_dashboard_no_conn`/
+`sales_dashboard_new`'s People/Returns relationships is `many:one` with
+uniqueness *confirmed* (not just assumed) wherever real extracted data was
+available. The `many:many` downgrade path was exercised with a synthetic
+duplicate-value People table (monkey-patched extracted rows) and correctly
+produced `many:many`/`bothDirections` while leaving the unaffected Returns
+relationship at `many:one` — direct proof the two relationships on one
+datasource are decided independently.
+
+**Not yet done / deliberately out of scope this session**: a worksheet
+field that is both (a) genuinely used and (b) owned by a dimension table
+(the `Region (People)` case above) is still declared on the flat/fact
+table even though that table's own M query can never produce it — this is
+a PRE-EXISTING gap (not introduced this session; confirmed the flat table
+already declared it with no possible M-query fulfilment before any of
+today's changes) that today's fix deliberately did not touch, to avoid
+creating a NEW dangling *visual* reference by removing it without also
+rewiring the visual pipeline to point at the real dimension table. Fully
+fixing this requires threading a per-column table name through the
+Report/Layout visual-generation pipeline (`_lookup_col` and every
+`_make_*_vc` caller currently assume one worksheet's datasource = one
+fixed table-qualified DAX reference) — Increment 22 explicitly scoped this
+same work out as "a much larger and riskier undertaking... in tension with
+this project's extend, don't rewrite rule," and that assessment still
+holds. This is the clear next priority for the semantic-model/relationship
+work: make dimension-table fields (not just fact-side fields) resolvable
+by the visual pipeline, starting from this exact reproducible case
+(`sales_dashboard`/`sales_dashboard_new`'s `sales_by_region` worksheet).
+The datatype-compatibility gate (fix 6 above) is implemented and code-
+reviewed but has no real or synthetic fixture that actually exercises the
+mismatch branch — worth a targeted synthetic test next time relationship
+work is touched. The audit report's per-relationship cardinality *reason*
+text (`_dim_notes`, e.g. "dimension key confirmed unique") does not
+currently render into `migration_audit.md`'s Data Model section — a
+pre-existing gap in `MigrationAudit`'s Markdown renderer (not something
+this session introduced or fixed); the underlying data is present in
+`migration_audit.json` via `set_data_model`'s `notes` parameter for now.
+
+---
+
+### Increment 32b — Same-session regression: cross-datasource 'Extract' table collision in the new multi-table hyper extraction
+
+Caught immediately after Increment 32 by the user, who attached a `.pbit`
+generated by the PRE-Increment-32 engine (`Finance Dashboard_v2026.1_old.pbit`)
+and reported it was "much better" than a freshly re-migrated one. Root-caused
+by direct structural comparison rather than guessing: the old file has 9
+tables (`Income_by_Country`, `Dso_vs_Dpo`, `CashFlow`, `Balance_Sheet`,
+`Revenue`, `Gross_Profit`, `Sheet35`, `Revenue_vs_Profit_Margin`, `Main_2`)
+with real column/measure counts; re-running the CURRENT engine against the
+same source workbook logged "Embedded data found in 2 datasource(s)" —
+only 2, not 9.
+
+**Root cause**: `Finance Dashboard_v2026.1.twbx` has 9 SEPARATE Tableau
+datasources, each with its own SEPARATE embedded `.hyper` extract file
+(`Data/Extracts/excel_direct_*.hyper` × 9) — confirmed by reading every one
+of the 9 files' JSON catalogs directly: **every single one names its own
+internal table `'Extract'`** (Tableau's generic default name for a simple,
+non-relationship extract — confirmed real, not assumed). Increment 32's new
+`_extract_hyper_schemas`-based Step 2 keyed every extracted table by its
+own hash-stripped clean name (`'Extract'` in this case, no hash to strip)
+so that a genuinely multi-table `.hyper` — the Orders/People/Returns case
+Increment 32 was built for — could store each of its real sub-tables
+separately. But keying by that shared generic name ACROSS datasources
+meant the second, third, ... ninth datasource's `_dest_key='Extract'` was
+already present in `result['datasources']` (from the first datasource), so
+`if key_name in result['datasources']: continue` silently dropped 8 of the
+9 datasources' real row data — and, since each was also meant to get an
+alias under its own real caption, that alias never happened either.
+
+**Fix** (`tableau_pbi_server.py`, `extract_twbx_data`): a hyper file that
+yields exactly ONE table (`len(table_schemas) == 1` — the common/simple-
+extract case, true for all 9 of this fixture's files) is now keyed by
+`ds_cap` directly — the exact same keying the pre-Increment-22-era code
+used, which is safe by construction (a Tableau datasource caption is
+unique within one workbook, so it can never collide across datasources).
+Only a hyper file that genuinely contains MULTIPLE real tables (an actual
+relationship-bearing extract, e.g. `sales_dashboard_no_conn.twbx`'s
+Orders/People/Returns) uses the new per-table clean-name keying, since
+those names are what the dimension-table builder actually looks up by.
+Applied the identical guard to Step 1b's embedded-Excel extraction (a
+datasource with only one relevant sheet is keyed by `ds_cap` too) as a
+preventative measure — no real fixture has hit that exact collision yet
+(two different datasources' embedded Excel files sharing a sheet name),
+but it is the same class of bug and the fix is the same shape, so there
+was no reason to leave it latent.
+
+**Verified**: re-ran `extract_twbx_data` directly against
+`Finance Dashboard_v2026.1.twbx` — all 9 datasources now extract with
+their real row counts (30/48/24/364/50/50/528/360/107 rows respectively,
+matching the old file's implied structure). Full `write_pbit()` re-run
+produced a `DataModelSchema` with the exact same 9 table names AND exact
+same column/measure counts as the user's attached pre-Increment-32
+`.pbit` (`Income_by_Country`: 7 cols/0 measures, `Dso_vs_Dpo`: 9/1,
+`CashFlow`: 5/1, `Balance_Sheet`: 10/1, `Revenue`: 8/0, `Gross_Profit`:
+9/0, `Sheet35`: 15/0, `Revenue_vs_Profit_Margin`: 9/2, `Main_2`: 38/12 —
+a field-by-field match, not just a table count match). Full regression
+re-run across all 10 fixtures in `source/`+`input/` after the fix: 10/10
+`write_pbit()` succeed with zero exceptions; independent dangling-visual-
+field-reference scan (same method as Increment 32) still clean on every
+fixture; `sales_dashboard`/`sales_dashboard_no_conn`'s genuinely
+multi-table Orders/People/Returns extraction (the case Increment 32 was
+built for) still correctly extracts all 3 real sub-tables per fixture —
+confirming the single-vs-multi-table branch picks the right keying
+strategy in both directions, not just the one that regressed.
+
+**Lesson for future increments touching `extract_twbx_data`**: Tableau's
+generic default table/extract names (`'Extract'`, and likely also default
+sheet names like `'Sheet1'`) are NOT unique across a workbook's
+datasources — only the datasource's own caption is guaranteed unique.
+Any future per-table keying scheme must keep this in mind rather than
+assuming a table's own internal name is a safe dict key on its own.

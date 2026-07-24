@@ -358,18 +358,32 @@ def _resolve_set_groupfilter(gf, group_by_name: dict, calc_caption_map: dict, de
 # Hyper / TWBX data extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_hyper_schema(hyper_bytes: bytes) -> dict:
-    """Extract table schema from a .hyper file's embedded JSON catalog.
+def _extract_hyper_schemas(hyper_bytes: bytes) -> list:
+    """Extract EVERY real table's schema from a .hyper file's embedded JSON
+    catalog — not just the first one found.
 
-    Returns:
+    A single embedded .hyper can back MULTIPLE real Tableau physical tables
+    joined together (e.g. a federated datasource's Orders/People/Returns all
+    materialised into one superstore_data.hyper) — confirmed real on
+    sales_dashboard_no_conn.twbx, where the catalog lists 3 separate
+    type='block' relations (Orders_<hash>, People_<hash>, Returns_<hash>).
+    The previous single-table version silently discarded every table but the
+    first, which meant dimension-side row data (needed for relationship
+    cardinality/uniqueness checks and dimension-table embedding) was never
+    even attempted for a multi-table extract.
+
+    Returns a list of:
         {
-          'name':        table name  (e.g. 'Extract'),
+          'name':        table name  (e.g. 'Extract' or 'Orders_<hash>'),
           'schema_name': schema/namespace name (e.g. 'Extract' or 'public'),
           'columns':     [{name, type, nullCount}, ...]
         }
-    or {} if nothing could be parsed.
+    in catalog order, deduplicated by table name. Empty list if nothing
+    could be parsed.
     """
     import json as _json
+    results = []
+    seen_names: set = set()
     i, n = 0, len(hyper_bytes)
     while i < n:
         idx = hyper_bytes.find(b'"relations"', i)
@@ -397,9 +411,12 @@ def _extract_hyper_schema(hyper_bytes: bytes) -> dict:
                       if 'oid' in ns and 'name' in ns}
             for rel in obj.get('relations', []):
                 if rel.get('type') == 'block' and rel.get('attributes'):
-                    tbl_name    = rel.get('name', 'Extract')
+                    tbl_name = rel.get('name', 'Extract')
+                    if tbl_name in seen_names:
+                        continue
+                    seen_names.add(tbl_name)
                     schema_name = ns_map.get(rel.get('parent'), 'Extract')
-                    return {
+                    results.append({
                         'name':        tbl_name,
                         'schema_name': schema_name,
                         'columns': [
@@ -409,12 +426,21 @@ def _extract_hyper_schema(hyper_bytes: bytes) -> dict:
                              'nullCount': rel.get('nullCounts', [0]*999)[idx2]}
                             for idx2, a in enumerate(rel['attributes'])
                         ]
-                    }
+                    })
         except Exception:
             print(f"[DEBUG except] line ~204: exception caught")
             pass
         i = idx + 1
-    return {}
+    return results
+
+
+def _extract_hyper_schema(hyper_bytes: bytes) -> dict:
+    """Back-compat single-table wrapper around _extract_hyper_schemas —
+    returns the first real table found, or {} if none. Prefer
+    _extract_hyper_schemas directly for any .hyper that may contain more
+    than one physical table (i.e. any real extract with relationships)."""
+    _schemas = _extract_hyper_schemas(hyper_bytes)
+    return _schemas[0] if _schemas else {}
 
 
 def _extract_hyper_lp_strings(hyper_bytes: bytes) -> list:
@@ -1235,6 +1261,136 @@ def extract_twbx_data(twbx_path: 'Path') -> dict:
                 except Exception as _ce:
                     print(f"[DEBUG except] CSV read {base}: {_ce}")
 
+            # ── Step 1b: Extract raw Excel files from datasources embedded ────
+            # in the twbx package. Unlike CSV, a single embedded .xlsx workbook
+            # can back SEVERAL Tableau physical tables — one per sheet (e.g.
+            # 'Data/Data Sources/sample_super_store.xlsx' backs the Orders/
+            # People/Returns sub-tables of a federated datasource via a shared
+            # named-connection) — confirmed real on sales_dashboard.twbx, whose
+            # generated Power BI query previously fell back to a fake
+            # 'C:\path\to\...' placeholder path because embedded Excel data was
+            # never extracted at all (only CSV/hyper were handled). Extracting
+            # it here lets the normal embed_sample_data path take over, so no
+            # file-path parameter (and therefore no placeholder) is needed.
+            try:
+                import openpyxl as _openpyxl
+            except ImportError:
+                _openpyxl = None
+
+            if _openpyxl is not None:
+                for ds in root.findall('.//datasource'):
+                    if 'Parameters' in ds.get('name', ''):
+                        continue
+                    ds_cap = ds.get('caption', ds.get('name', ''))
+                    # named-connection name -> embedded Excel filename (as
+                    # stored in the twbx zip, e.g. 'Data/Data Sources/x.xlsx')
+                    _nc_files: dict = {}
+                    for _nc in ds.findall('.//named-connection'):
+                        _inner = _nc.find('./connection')
+                        if _inner is not None:
+                            _fn = _inner.get('filename', '')
+                            if _fn.lower().endswith(('.xlsx', '.xls', '.xlsm')):
+                                _nc_files[_nc.get('name', '')] = _fn
+                    if not _nc_files:
+                        continue
+                    # <relation type="table" name="Orders" table="[Orders$]">'s
+                    # name IS the sheet name Tableau reads from that workbook.
+                    _rel_to_file: dict = {}
+                    for _rel in ds.findall('.//relation[@type="table"]'):
+                        _fn = _nc_files.get(_rel.get('connection', ''))
+                        if _fn:
+                            _rel_to_file[_rel.get('name', '')] = _fn
+
+                    def _find_zip_entry(fn):
+                        if fn in names:
+                            return fn
+                        _base = fn.split('/')[-1]
+                        return next((nm for nm in names if nm.split('/')[-1] == _base), None)
+
+                    # Same reasoning as Step 2's identical single-vs-multi-
+                    # table guard below: a datasource with only ONE relevant
+                    # sheet is keyed by ds_cap directly (unique per
+                    # datasource, so it can never collide with another
+                    # datasource's identically-named sheet) rather than by
+                    # the bare sheet/relation name, which multiple different
+                    # embedded workbooks could plausibly share (e.g. two
+                    # datasources each with their own 'Sheet1').
+                    _single_sheet_ds = len(_rel_to_file) == 1
+                    _wb_cache: dict = {}
+                    _row_counts: dict = {}
+                    for _rel_name, _zip_fn in _rel_to_file.items():
+                        _dest_key = ds_cap if _single_sheet_ds else _rel_name
+                        if not _rel_name or _dest_key in result['datasources']:
+                            continue  # already loaded via CSV/hyper step above
+                        _zpath = _find_zip_entry(_zip_fn)
+                        if _zpath is None:
+                            continue
+                        if _zpath not in _wb_cache:
+                            try:
+                                _wb_cache[_zpath] = _openpyxl.load_workbook(
+                                    _io.BytesIO(z.read(_zpath)),
+                                    read_only=True, data_only=True)
+                            except Exception as _xe:
+                                log('warn', f'extract_twbx_data: could not open '
+                                    f'embedded Excel {_zpath}: {_xe}')
+                                _wb_cache[_zpath] = None
+                        _wb = _wb_cache[_zpath]
+                        if _wb is None or _rel_name not in _wb.sheetnames:
+                            continue
+                        try:
+                            _ws = _wb[_rel_name]
+                            _rows_iter = _ws.iter_rows(values_only=True)
+                            _header = next(_rows_iter, None)
+                            if not _header:
+                                continue
+                            _fieldnames = [str(h) if h is not None else f'Column{i}'
+                                           for i, h in enumerate(_header)]
+                            _raw_rows = []
+                            for _i, _r in enumerate(_rows_iter):
+                                if _i >= 10000:
+                                    break
+                                _raw_rows.append(dict(zip(_fieldnames, _r)))
+
+                            def _cellstr(v):
+                                import datetime as _dtm
+                                if v is None:
+                                    return ''
+                                if isinstance(v, (_dtm.datetime, _dtm.date)):
+                                    return v.isoformat()
+                                return str(v)
+
+                            _samples = {fn: [_cellstr(rr.get(fn)) for rr in _raw_rows[:5]]
+                                        for fn in _fieldnames}
+                            _schema_cols = [{'name': fn,
+                                              'datatype': _infer_dtype(
+                                                  fn, _samples.get(fn, []),
+                                                  _col_dtype.get(fn.lower(), ''))}
+                                             for fn in _fieldnames]
+                            _out_rows = [{fn: _cellstr(rr.get(fn)) for fn in _fieldnames}
+                                         for rr in _raw_rows]
+                            result['datasources'][_dest_key] = {
+                                'hyper_file': _zpath.split('/')[-1],
+                                'schema':     _schema_cols,
+                                'rows':       _out_rows,
+                            }
+                            result['has_data'] = True
+                            _row_counts[_dest_key] = len(_out_rows)
+                            log('info', f"  ↳ {_dest_key!r}: {len(_out_rows)} rows "
+                                f"× {len(_schema_cols)} cols from embedded Excel "
+                                f"{_zpath} (sheet {_rel_name!r})")
+                        except Exception as _xe2:
+                            log('warn', f'extract_twbx_data: sheet {_rel_name!r} '
+                                f'read failed: {_xe2}')
+
+                    # Alias the largest real sheet under the outer datasource
+                    # caption too — the flat/fact table's embed lookup in
+                    # build_data_model_schema is keyed by the Tableau
+                    # datasource caption (e.g. 'superstore_data'), which never
+                    # matches an individual sheet name directly.
+                    if _row_counts and ds_cap not in result['datasources']:
+                        _primary = max(_row_counts, key=_row_counts.get)
+                        result['datasources'][ds_cap] = result['datasources'][_primary]
+
             # ── Step 2: Extract from hyper files for any remaining datasources ─
             ds_to_hyper: dict = {}
             for ds in root.findall('.//datasource'):
@@ -1257,35 +1413,77 @@ def extract_twbx_data(twbx_path: 'Path') -> dict:
                     ds_to_hyper[cap] = basename
 
             for ds_cap, hyper_fname in ds_to_hyper.items():
-                # Skip if already loaded from CSV (federated datasources)
-                if ds_cap in result['datasources']:
-                    continue
                 try:
                     hyper_bytes = z.read(hyper_map[hyper_fname])
                 except Exception:
                     print(f"[DEBUG except] hyper read {hyper_fname}: exception")
                     continue
 
-                schema_info = _extract_hyper_schema(hyper_bytes)
-                if not schema_info:
+                # A single embedded .hyper can back MULTIPLE real Tableau
+                # tables joined together (e.g. Orders/People/Returns) — see
+                # _extract_hyper_schemas. Extract every one, not just the
+                # first, keyed by its clean (hash-suffix-stripped) name so
+                # dimension-table embedding / relationship-cardinality checks
+                # can find real per-table data instead of falling back to
+                # synthetic (and potentially duplicate-value) rows.
+                #
+                # IMPORTANT: Tableau gives every SIMPLE (non-relationship)
+                # extract's single internal table the same generic name
+                # 'Extract' regardless of which datasource it came from —
+                # confirmed real on Finance Dashboard_v2026.1.twbx, which has
+                # 9 separate single-table .hyper files (one per worksheet's
+                # own datasource) that ALL name their table 'Extract'. Keying
+                # by that shared clean name across DIFFERENT datasources
+                # would make every one after the first look like an
+                # already-seen duplicate and silently drop it — a real
+                # regression caught by comparing against a known-good
+                # pre-existing .pbit (only 2 of 9 datasources' data survived
+                # instead of 9). So: a hyper file with exactly ONE table is
+                # keyed by ds_cap directly (matches the original, proven-
+                # correct single-table behaviour — ds_cap is unique per
+                # datasource, so this can never collide). Only a hyper file
+                # that genuinely contains MULTIPLE tables (a real
+                # relationship-bearing extract) uses per-table clean-name
+                # keying, since those names (e.g. 'Orders'/'People'/
+                # 'Returns') are what dimension-table lookups need.
+                table_schemas = _extract_hyper_schemas(hyper_bytes)
+                if not table_schemas:
                     continue
 
-                raw_schema_cols = schema_info.get('columns', [])
-                tbl_name    = schema_info.get('name', 'Extract')
-                schema_name = schema_info.get('schema_name', 'Extract')
-                schema_cols = [
-                    {**c, '_schema': schema_name, '_table': tbl_name}
-                    for c in raw_schema_cols
-                ]
-                rows = _extract_hyper_rows(hyper_bytes, schema_cols)
-                result['datasources'][ds_cap] = {
-                    'hyper_file': hyper_fname,
-                    'schema':     schema_cols,
-                    'rows':       rows,
-                }
-                result['has_data'] = True
-                log('info', f'  ↳ {ds_cap!r}: {len(rows)} rows '
-                    f'× {len(schema_cols)} cols from {hyper_fname}')
+                import re as _re_hs
+                _row_counts2: dict = {}
+                _single_table = len(table_schemas) == 1
+                for schema_info in table_schemas:
+                    raw_schema_cols = schema_info.get('columns', [])
+                    tbl_name    = schema_info.get('name', 'Extract')
+                    schema_name = schema_info.get('schema_name', 'Extract')
+                    schema_cols = [
+                        {**c, '_schema': schema_name, '_table': tbl_name}
+                        for c in raw_schema_cols
+                    ]
+                    if _single_table:
+                        key_name = ds_cap
+                    else:
+                        key_name = _re_hs.sub(r'_[A-Fa-f0-9]{32}$', '', tbl_name) or tbl_name
+                    if key_name in result['datasources']:
+                        continue  # already loaded via CSV/Excel step above
+                    rows = _extract_hyper_rows(hyper_bytes, schema_cols)
+                    result['datasources'][key_name] = {
+                        'hyper_file': hyper_fname,
+                        'schema':     schema_cols,
+                        'rows':       rows,
+                    }
+                    result['has_data'] = True
+                    _row_counts2[key_name] = len(rows)
+                    log('info', f'  ↳ {key_name!r}: {len(rows)} rows '
+                        f'× {len(schema_cols)} cols from {hyper_fname}')
+
+                # Alias the largest real table under the outer datasource
+                # caption too (see Step 1b's identical rationale). No-op in
+                # the single-table case: key_name already IS ds_cap above.
+                if _row_counts2 and ds_cap not in result['datasources']:
+                    _primary2 = max(_row_counts2, key=_row_counts2.get)
+                    result['datasources'][ds_cap] = result['datasources'][_primary2]
 
     except Exception as _e:
         log('warn', f'extract_twbx_data error: {_e}')
@@ -1863,6 +2061,18 @@ def parse_tableau_workbook(path: Path) -> dict:
                 'Longitude':   'Longitude',
             }
             _geo_category = _GEO_CATEGORY.get(_sr_prefix, '')
+            # Is this field genuinely referenced by some worksheet (present in
+            # the datasource-dependencies pre-scan below), as opposed to only
+            # being a raw physical-schema descriptor picked up by Pass 2's
+            # recursive `.//column` scan (e.g. a <relation><columns><column>
+            # entry describing a joined sub-table's own sheet layout, never
+            # dragged onto any shelf)? Used later (build_data_model_schema)
+            # to tell a genuinely-unused cross-table schema leak (safe to
+            # drop from the flat/fact table — it can never be produced by
+            # that table's own M query anyway) apart from a field a
+            # worksheet actually uses (left alone, unchanged from prior
+            # behaviour, to avoid creating a dangling visual reference).
+            _ws_used = f'[{col_name}]' in _dep_col_registry.get(ds_name, {})
             columns.append({
                 'name':        col_caption or col_name,
                 'source_name': col_name,
@@ -1871,6 +2081,7 @@ def parse_tableau_workbook(path: Path) -> dict:
                 'hidden':      hidden,
                 'measure':     col_type == 'quantitative' and role == 'measure',
                 'tableau_format': col.get('default-format', ''),
+                '_worksheet_used': _ws_used,
                 **({'geo_category': _geo_category} if _geo_category else {}),
             })
 
@@ -3668,7 +3879,14 @@ def parse_tableau_workbook(path: Path) -> dict:
                 chart_type = 'clusteredBarChart'
 
         elif (pane_marks
-              and all(m in _HEATMAP_MARKS for m in pane_marks)
+              # Heatmap mark type: Tableau 'Square'/'Rect'/'Polygon' with color
+              # encoding -> PBI matrix (pivotTable). Defined inline here (pre-
+              # existing bug: the module previously only defined this set
+              # further down in the same function, after this first use,
+              # raising "cannot access free variable '_HEATMAP_MARKS'" for
+              # any worksheet whose chart-type resolution actually reaches
+              # this branch — confirmed real on input/sales_dashboard.twbx).
+              and all(m in {'Square', 'Rect', 'Polygon'} for m in pane_marks)
               and color_fields_ws
               and (rows_tokens or cols_tokens)):
             # Heatmap: Square/Rect/Polygon marks with color encoding and axes
@@ -4606,10 +4824,84 @@ def parse_tableau_workbook(path: Path) -> dict:
     # <metadata-records><metadata-record class="column"><local-name>/
     # <parent-name> (confirmed real in all fixtures with relationships) —
     # not guessed from column-name heuristics.
+    def _infer_relationships_from_cols_map(_ds_el):
+        """Infer join relationships for a datasource that declares NO
+        <object-graph><relationships> block at all — the older
+        <relation type='collection'> physical style (a flat list of
+        type='table' sub-relations plus a <cols> map assigning every field
+        to its owning physical table), used by standalone .twb exports that
+        never went through Tableau's newer Relationships (logical layer) UI.
+
+        Confirmed real on sales_dashboard_new.twb: no <object-graph>
+        anywhere, but its <cols> map contains both a plain '[Region]' ->
+        '[Orders].[Region]' entry and a disambiguated '[Region (People)]' ->
+        '[People].[Region]' entry — Tableau's own standing convention for
+        "this field collides with one on another table" (the SAME suffix
+        convention _strip_dim_disambig_suffix already strips when building
+        dimension tables below). Without this, such a datasource never gets
+        a _dim_split at all: every sub-table's columns (e.g. Regional
+        Manager, a People-only field) leak into the single flat/fact table's
+        column list via Pass 2's recursive `.//column` scan, so Power BI's
+        TOM declares a column the fact table's own M query (which only ever
+        reads ONE physical sheet) never produces — "The column '...' of the
+        table wasn't found."
+
+        Returns relationship dicts shaped identically to the <object-graph>
+        parsing above (fromTable/fromColumn/toTable/toColumn, using
+        col_table-space keys — i.e. the disambiguated bracket-stripped name,
+        not the bare physical column name) so every downstream consumer
+        (_ds_dim_table_info, the dimension-table builder, the relationship-
+        emission loop) works unchanged regardless of which XML shape the
+        relationship was discovered in.
+        """
+        _cols_map_el = _ds_el.find('.//cols')
+        if _cols_map_el is None:
+            return []
+        _field_table: dict = {}   # col_table-space key -> (table, physical_col)
+        for _m in _cols_map_el.findall('map'):
+            _key = (_m.get('key') or '').strip('[]')
+            _val = _m.get('value') or ''
+            _vm = _re_rel.match(r'^\[([^\[\]]+)\]\.\[([^\[\]]+)\]$', _val)
+            if _key and _vm:
+                _field_table[_key] = (_vm.group(1), _vm.group(2))
+        if len(_field_table) < 2:
+            return []
+        _tables_used = {_t for _t, _c in _field_table.values()}
+        if len(_tables_used) < 2:
+            return []
+        from collections import Counter as _Counter_cm
+        _fact_tbl = _Counter_cm(_t for _t, _c in _field_table.values()).most_common(1)[0][0]
+        _rels_out = []
+        for _key, (_tbl, _col) in _field_table.items():
+            if _tbl == _fact_tbl:
+                continue
+            _suffix_m = _re_rel.match(r'^(.+) \(' + _re_rel.escape(_tbl) + r'\)$', _key)
+            if not _suffix_m:
+                continue
+            _base = _suffix_m.group(1)
+            _fact_side = _field_table.get(_base)
+            if _fact_side and _fact_side[0] == _fact_tbl:
+                _rels_out.append({
+                    'fromTable':  _fact_tbl,
+                    'fromColumn': _base,
+                    'toTable':    _tbl,
+                    'toColumn':   _key,
+                })
+        return _rels_out
+
     _ds_dim_table_info: dict = {}   # ds raw name -> {fact_table, col_table, dim_tables, relationships}
     for _ds in root.findall('.//datasource'):
         _ds_name_rel = _ds.get('name', '')
         _rels_here = _ds_relationships.get(_ds_name_rel, [])
+        if not _rels_here:
+            # Fallback: no <object-graph> relationships declared — a
+            # type='collection' multi-table datasource may still encode the
+            # same join intent via its <cols> map. Mutually exclusive with
+            # the block above (only fires when that found nothing).
+            _rels_here = _infer_relationships_from_cols_map(_ds)
+            if _rels_here:
+                _ds_relationships[_ds_name_rel] = _rels_here
+                _pbi_relationships.extend(_rels_here)
         if not _rels_here:
             continue   # no real relationships on this datasource — nothing to split out
 
@@ -10826,7 +11118,34 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
                     'hidden': True, 'tableau_format': '',
                 })
                 _existing_fk_keys.add(_fk_name)
+
+        # A datasource with a real _dim_split has genuine per-table column
+        # ownership known via col_table (metadata-records-derived). Pass 2's
+        # column collection (parse_tableau_workbook) recursively scans every
+        # <relation><columns> block regardless of which table it belongs to,
+        # so a dimension-only field (e.g. 'Regional Manager', which lives
+        # only on the People sub-table) can leak into ds['columns'] even
+        # though the flat/fact table's own M query only ever reads the fact
+        # table's physical sheet. Declaring it as a TOM column when the M
+        # query can never produce it is exactly Power BI's "The column '...'
+        # of the table wasn't found" error — confirmed real on
+        # sales_dashboard_new.twb. Columns whose col_table-declared owner is
+        # a DIFFERENT real table than this datasource's fact table are
+        # dropped from the flat table here; they still reach the model via
+        # their own dedicated dimension table (built further down from this
+        # same ds['columns'] list, unaffected since this filter is local to
+        # this loop only).
+        _dim_split_ct = ds['_dim_split']['col_table'] if ds.get('_dim_split') else {}
+        _dim_split_fact = ds['_dim_split']['fact_table'] if ds.get('_dim_split') else None
+
         for c in ds['columns']:
+            if _dim_split_fact:
+                _owner = _dim_split_ct.get(c.get('source_name') or c['name'])
+                if (isinstance(_owner, dict) and _owner.get('table')
+                        and _owner['table'] != _dim_split_fact
+                        and (c.get('source_name') or c['name']) not in _relationship_fk_names
+                        and not c.get('_worksheet_used')):
+                    continue
             if c.get('hidden'):
                 _fk_key = c.get('source_name') or c['name']
                 if _fk_key not in _relationship_fk_names:
@@ -12150,11 +12469,16 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
     pbi_model_rels = []
     _dim_notes: list = []   # (description, status, detail) for the audit report
 
-    def _sample_key_unique(_dim_tbl, _raw_key):
-        """Best-effort cardinality check: is the FK's target column unique in
-        the real extracted sample rows for that table? None when unknown
-        (no extracted data) — callers must not treat None as a negative."""
-        _entry = (extracted_data or {}).get('datasources', {}).get(_dim_tbl)
+    def _sample_key_unique(_tbl_cap, _raw_key):
+        """Cardinality check: is this column unique in the real extracted
+        sample rows for that table (fact OR dimension side — this is no
+        longer dimension-only, see below)? Returns True/False when the real
+        extracted data settles it, None when unknown (no extracted data) —
+        callers must not treat None as a negative. Non-null values only:
+        Power BI's own uniqueness constraint on a relationship's "one" side
+        ignores BLANK/null, so a key that only repeats via nulls is still a
+        valid one-side key."""
+        _entry = (extracted_data or {}).get('datasources', {}).get(_tbl_cap)
         if not _entry or not _entry.get('rows'):
             return None
         def _nrm(s): return str(s).lower().replace(' ', '').replace('_', '').replace('-', '')
@@ -12163,7 +12487,8 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
         for _row in _entry['rows']:
             for _k, _v in _row.items():
                 if _nrm(_k) == _kn:
-                    _vals.append(_v)
+                    if _v not in (None, ''):
+                        _vals.append(_v)
                     break
         if not _vals:
             return None
@@ -12176,6 +12501,11 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
         fact_pbi_table = ds['_pbi_table_name']
         fact_col_map   = ds.get('_col_name_map', {})
         col_table      = _split['col_table']
+        fact_ds_cap    = ds.get('name', '') or ds.get('raw_name', '')
+        _fact_table_dict = next((t for t in tables if t['name'] == fact_pbi_table), None)
+        _fact_col_dtypes = ({c['name']: c.get('dataType')
+                              for c in _fact_table_dict.get('columns', [])}
+                             if _fact_table_dict else {})
 
         for _dim_raw_name, _dim_conn in _split['dim_tables'].items():
             _dim_cols = [c for c in ds['columns']
@@ -12215,6 +12545,8 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
             if _dim_param_table:
                 tables.append(_dim_param_table)
 
+            _dim_col_dtypes = {c['name']: c.get('dataType') for c in _dim_table_dict.get('columns', [])}
+
             for _rel in _split['relationships']:
                 if _rel['toTable'] != _dim_raw_name or _rel['fromTable'] != _split['fact_table']:
                     continue
@@ -12225,33 +12557,96 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
                                         f"{_rel['toTable']}.{_rel['toColumn']}", 'skipped',
                                         'FK or PK column did not resolve to a real generated column'))
                     continue
+
+                # ── Datatype compatibility (master-spec requirement) ────────
+                # Never create a relationship whose two sides have different
+                # final PBI datatypes — that is exactly what produces "DAX
+                # comparison operations do not support comparing values of
+                # type Number with values of type Text" once Power BI tries
+                # to build/use the relationship. Skip rather than silently
+                # emit a broken one; VALUE()/FORMAT() coercion is deliberately
+                # not attempted here (would mask a real schema mismatch).
+                _fk_dtype = _fact_col_dtypes.get(_fk_final)
+                _pk_dtype = _dim_col_dtypes.get(_pk_final)
+                if _fk_dtype and _pk_dtype and _fk_dtype != _pk_dtype:
+                    _dim_notes.append((
+                        f"{fact_pbi_table}.{_fk_final} -> {_dim_pbi_name}.{_pk_final}",
+                        'skipped',
+                        f"datatype mismatch — fact key is '{_fk_dtype}', "
+                        f"dimension key is '{_pk_dtype}'; creating this "
+                        f"relationship would risk a DAX Number-vs-Text error"
+                    ))
+                    continue
+
+                # ── Cardinality inference from real extracted data ──────────
+                # Tableau's <relationships> logical layer always DECLARES a
+                # detail(many)->dimension(one) join, but that is only a
+                # declaration of INTENT — Power BI enforces uniqueness on
+                # whichever side is marked "one" at the DATA level. Check
+                # both sides against real extracted sample rows when
+                # available (never trust the Tableau convention blindly) —
+                # confirmed necessary: a naive many:one default would emit an
+                # invalid model whenever the "one" side's real data actually
+                # contains duplicates (e.g. Power BI's own "Column '...'
+                # contains a duplicate value ... this is not allowed for
+                # columns on the one side of a many-to-one relationship").
                 _raw_pk  = _strip_dim_disambig_suffix(_rel['toColumn'], _dim_raw_name)
-                _unique  = _sample_key_unique(_dim_raw_name, _raw_pk)
+                _raw_fk  = _rel['fromColumn']
+                _dim_unique  = _sample_key_unique(_dim_raw_name, _raw_pk)
+                _fact_unique = _sample_key_unique(fact_ds_cap, _raw_fk)
+
+                if _dim_unique is True and _fact_unique is True:
+                    _from_card, _to_card, _cf_dir = 'one', 'one', 'oneDirection'
+                    _card_note = 'one:one (both keys confirmed unique by sample data)'
+                elif _dim_unique is True:
+                    _from_card, _to_card, _cf_dir = 'many', 'one', 'oneDirection'
+                    _card_note = ('many:one (dimension key confirmed unique; fact key '
+                                  + ('confirmed non-unique)' if _fact_unique is False
+                                     else 'not verified)'))
+                elif _fact_unique is True:
+                    # Real data contradicts Tableau's fact(many)->dim(one)
+                    # convention for this key — the fact side is actually the
+                    # unique one. Swap so Power BI's own one-side uniqueness
+                    # constraint isn't violated.
+                    _from_card, _to_card, _cf_dir = 'one', 'many', 'oneDirection'
+                    _card_note = ('one:many (fact key confirmed unique; dimension key is '
+                                  'not — swapped from the Tableau many:one convention)')
+                elif _dim_unique is False:
+                    # Dimension key confirmed NON-unique (with or without
+                    # fact-side confirmation) — many:one would be a genuinely
+                    # invalid model. many:many is the only cardinality Power
+                    # BI can load without erroring on this real data.
+                    _from_card, _to_card, _cf_dir = 'many', 'many', 'bothDirections'
+                    _card_note = ('many:many (dimension key confirmed NON-unique by sample '
+                                  'data — many:one would violate Power BI\'s one-side '
+                                  'uniqueness constraint)')
+                else:
+                    # Neither side verifiable (no extracted sample data for
+                    # either) — keep the existing conservative default, but
+                    # label it as an unverified heuristic, not a confirmed fact.
+                    _from_card, _to_card, _cf_dir = 'many', 'one', 'oneDirection'
+                    _card_note = ('many:one (Tableau relationship convention — unverified, '
+                                  'no extracted sample data for either side)')
+
                 pbi_model_rels.append({
                     "name":                   f"{fact_pbi_table}_{_fk_final}_{_dim_pbi_name}_{_pk_final}",
                     "fromTable":              fact_pbi_table,
                     "fromColumn":             _fk_final,
                     "toTable":                _dim_pbi_name,
                     "toColumn":               _pk_final,
-                    # Tableau's <relationships> logical layer is always a
-                    # detail(many)-to-dimension(one) join by convention (see
-                    # the fact-table-detection note above) — schema-verified
-                    # TMSL property names from learn.microsoft.com/
-                    # analysis-services/tmsl/relationships-object-tmsl.
-                    "fromCardinality":        "many",
-                    "toCardinality":          "one",
-                    "crossFilteringBehavior": "oneDirection",
+                    # Schema-verified TMSL property names from
+                    # learn.microsoft.com/analysis-services/tmsl/
+                    # relationships-object-tmsl.
+                    "fromCardinality":        _from_card,
+                    "toCardinality":          _to_card,
+                    "crossFilteringBehavior": _cf_dir,
                     "joinOnDateBehavior":     "datePartOnly",
                     "isActive":               True,
                 })
                 _dim_notes.append((
                     f"{fact_pbi_table}.{_fk_final} -> {_dim_pbi_name}.{_pk_final}",
                     'created',
-                    'cardinality many:one (Tableau relationship convention); '
-                    'sample key uniqueness '
-                    + ('confirmed' if _unique else
-                       'contradicted by sample data — verify in Power BI' if _unique is False
-                       else 'not verifiable — no extracted sample data')
+                    f'cardinality {_card_note}'
                 ))
 
     # ── Data model validation & repair (master-spec requirement) ────────────
@@ -12287,6 +12682,30 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
         _r['name'] = _rname
         _validated_rels.append(_r)
     pbi_model_rels = _validated_rels
+
+    # ── Placeholder datasource path scan (master-spec requirement) ──────────
+    # The generated Power BI report must never contain a fake placeholder
+    # path (see _resolve_literal_file_path) unless the real datasource
+    # location genuinely could not be resolved from the workbook/package —
+    # in which case this must be a clear, visible audit warning rather than
+    # a silent broken query. Scans every table's M-query text, not just
+    # FilePath parameter tables, since a literal join-leaf path (physical
+    # join-tree M queries) is inlined directly rather than parameterised.
+    for _t in tables:
+        for _part in _t.get('partitions', []):
+            _expr = _part.get('source', {}).get('expression', '')
+            _expr_text = '\n'.join(_expr) if isinstance(_expr, list) else str(_expr)
+            if 'path\\\\to\\\\' in _expr_text or 'path\\to\\' in _expr_text:
+                _dim_notes.append((
+                    _t['name'], 'warning',
+                    'generated M query still contains a placeholder datasource path — '
+                    'the real source file location could not be resolved from the '
+                    'workbook/package; point Power BI\'s file-path parameter at the '
+                    'real file before refreshing'
+                ))
+                log('warn', f"[DataModel] Table '{_t['name']}' has an unresolved "
+                    f"placeholder datasource path")
+                break
 
     # Finalise audit — log summary; write() is called from write_pbit
     _audit.set_data_model([t['name'] for t in tables], pbi_model_rels, _dim_notes)
