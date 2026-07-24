@@ -3535,3 +3535,336 @@ sheet names like `'Sheet1'`) are NOT unique across a workbook's
 datasources — only the datasource's own caption is guaranteed unique.
 Any future per-table keying scheme must keep this in mind rather than
 assuming a table's own internal name is a safe dict key on its own.
+
+---
+
+### Increment 32c — Backfill worksheet-used relationship join-key columns (real blank-chart bug from user-supplied .pbit files)
+
+The user uploaded actual generated `.pbit` outputs (`sales_dashboard.pbit`,
+`sales_dashboard_new.pbit`, `sales_dashboard_no_conn.pbit`,
+`Finance Dashboard_v2026.1.pbit`) into `target/` from a run of the
+Increment 32/32b-fixed engine and reported the sales_dashboard-family files
+"still have issues." Inspected each `.pbit`'s real `DataModelSchema`
+directly: all four now have the CORRECT table/relationship structure
+(confirmed field-for-field matching the expected Increment 32/32b output —
+no placeholder paths, no dangling relationships, correct many:one
+cardinality). So the remaining issue had to be something the structural
+audit doesn't catch — traced it to the exact residual gap flagged at the
+end of Increment 32: `superstore_data`'s `'Region (People)'` column (used
+by the `sales_by_region` worksheet) is declared in the TOM but every row
+evaluates to `NULL`, confirmed directly in the uploaded file's own M query
+(`#"Region (People)" = text` in the schema, `null` in every embedded data
+row). That worksheet's chart would render as a completely empty/blank bar
+chart in Power BI — a real, user-visible bug, not just a theoretical gap.
+
+**Fix, without the large visual-pipeline rewiring Increment 22/32 both
+deferred**: realised the specific field involved — `'Region (People)'` —
+isn't just SOME dimension-table field; it is literally the relationship's
+own dimension-side join key (`toColumn`). Tableau's relationship join
+condition (`Orders.Region = People.Region`) is an equality, so wherever the
+relationship holds, `People.Region` is by definition identical to
+`Orders.Region` — meaning the flat table doesn't need a real cross-table
+join to populate this specific column correctly; a same-row copy from the
+already-present fact-side column suffices. New `_append_m_copy_columns()`
+(module-level M-query helper) appends a `Table.AddColumn` step to any
+already-built M query (works uniformly across the sample/CSV/Excel/
+generic/join-tree/live-DB paths — it operates on the finished M text, not
+on any one builder). Wired into the main per-datasource loop, right after
+`m_query` is finalized: for every dimension column kept on the flat table
+because it's worksheet-used (see Increment 32's `_worksheet_used` guard),
+if its raw key exactly matches some relationship's `toColumn`, queue a
+copy from that relationship's `fromColumn` (already resolved to its final
+PBI name via `col_name_map`) and append the steps. Scoped deliberately
+narrow: only fires for a column that IS a relationship's own join key —
+does NOT attempt to backfill an arbitrary dimension attribute (e.g.
+`Regional Manager`) via a real lookup/join, which remains the correctly-
+scoped-out larger undertaking noted in Increment 32.
+
+**Verified**: re-ran `write_pbit()` on `sales_dashboard.twbx`,
+`sales_dashboard_no_conn.twbx`, and `sales_dashboard_new.twb` — all three
+now log `"backfilled 1 worksheet-used relationship join-key column(s)...
+'Region (People)'<-'Region'"`, and the generated M query's final step is
+`Table.AddColumn(..., "Region (People)", each [Region])` in every case
+(embed_sample_data mode for the two `.twbx` fixtures AND file-path-
+parameter mode for the plain `.twb` — confirmed both paths since the
+helper operates on already-finished M text regardless of which builder
+produced it). Full 10-fixture regression re-run: 10/10 `write_pbit()`
+succeed with zero exceptions, and the same independent dangling-visual-
+field-reference scan used in Increment 32/32b is still clean everywhere
+(zero dangling references, including on the 3 fixtures this fix touched).
+
+**Not yet done**: any dimension attribute that is NOT itself a
+relationship's join key (e.g. `Regional Manager`) is still unproducible on
+the flat table if some future workbook's worksheet references it directly
+— that requires the real lookup/join Increment 22/32 both explicitly
+scoped out. No current fixture exercises that case (the only real
+worksheet-used dimension field across all 12 fixtures is the join-key case
+this increment fixes), so it remains a flagged gap, not a regression.
+
+---
+
+### Increment 33 — Aggregation semantics + physical table/relationship reconstruction (user-directed, `measures_and_relationships_enhancement_prompt.md`)
+
+New session. The user's prompt named two remaining semantic gaps: (1)
+Tableau aggregation semantics (SUM/AVG/MIN/MAX/COUNT/COUNTD/MEDIAN) not
+preserved correctly, and (2) the Tableau datasource caption
+(`superstore_data`) standing in for the real physical tables
+(`Orders`/`People`/`Returns`) instead of being reconstructed as them. Both
+root-caused against the real codebase and real fixtures before any fix —
+Issue 1 turned out to be real and confirmed on an existing regression
+fixture (`House Sales Dashboard.twb`) that had been silently wrong the
+whole time; Issue 2 was a real, generic naming gap.
+
+**Root cause of Issue 1 (aggregation semantics)**: the CORE architecture
+was already correct — `_clean_field_name` already strips Tableau's
+aggregation-prefix shelf tokens (`sum:`/`avg:`/`min:`/etc.) down to the
+bare physical field name without ever fabricating a physical column named
+e.g. `"Sum of Sales"` (confirmed by scanning every generated fixture's TOM
+`columns` array directly: zero matches for any aggregation-prefixed name —
+`Sum of X` etc. only ever appear as real DAX **measures**, which is
+correct and matches Power BI Desktop's own default-aggregation display-
+name convention). The real bug was narrower but still generic: of
+Tableau's aggregation prefixes, only `sum:` (implicit, via a blanket
+"any numeric field on a row/column shelf gets a `Sum of X` measure" pass)
+and `ctd:` (COUNT DISTINCT, via a dedicated `_ctd_measure_map` mechanism)
+were ever actually detected and given their own measure. **`avg:`/`min:`/
+`max:`/`med:` (MEDIAN) were parsed into shelf tokens
+(`_parse_shelf_tokens` returns `{'agg': prefix, ...}`) but the `'agg'` key
+was read in exactly ONE place in this ~21,000-line file — a narrow `'bin'`
+check for histogram detection — and discarded everywhere else.** Confirmed
+this silently coerced every AVG/MIN/MAX/MEDIAN field to SUM by:
+grepping every native-aggregation `'Function':` JSON code in the file
+(only `0`=Sum and `5`=CountNonNull ever appear — never 1/2/3/4) and by
+finding zero `"AVERAGE("`/`"MIN("`/`"MAX("`/`"MEDIAN("` DAX generation
+anywhere. Reproduced on a REAL existing fixture, not synthesized:
+`input/House Sales Dashboard.twb`'s own `<column-instance
+derivation='Avg'>` on `price`, actively used by 4 worksheets — one of them
+literally named **"Average House Sales Price"** — which were all silently
+rendering `SUM(Price)` before this fix.
+
+**Fix (fix 1 of 2, `tableau_pbi_server.py`)**: generalised the existing,
+already-proven `ctd:` detection/measure-creation pattern (previously
+duplicated nowhere — it was the only one of its kind) into one shared
+implementation used by all five explicit aggregations:
+- New `_scan_agg_fields(deriv_name, prefix)` (parse-time, nested in
+  `parse_tableau_workbook`, replacing the old ctd-only inline block):
+  scans the same 3 real sources per worksheet (`<column-instance
+  derivation=...>`, raw shelf-token `prefix:Field:qk`, pane-encoding
+  tokens) generically for any aggregation kind. Called once per kind
+  (`ctd`/`avg`/`min`/`max`/`med`/`cnt`) and stored on the worksheet dict as
+  `ctd_fields`/`avg_fields`/`min_fields`/`max_fields`/`med_fields`/
+  `cnt_fields`.
+- New `_build_explicit_agg_measures(ws_field_key, dax_fn, display_prefix)`
+  (in `build_data_model_schema`, replacing the old ctd-only inline block):
+  generates one real DAX measure per referenced column
+  (`AVERAGE`/`MIN`/`MAX`/`MEDIAN`/`COUNT`/`DISTINCTCOUNT`), stored in
+  `ds['_avg_measure_map']` etc., mirroring the existing `_ctd_measure_map`
+  exactly.
+- `MeasureRegistry` (used by `build_report_layout`'s visual-field
+  resolution) extended with a data-driven `_EXPLICIT_AGG_KINDS` list so
+  `resolve()`'s priority order is now: named calc → count-distinct →
+  median → max → min → average → count → **sum (fallback)** — a field
+  the user explicitly aggregated as non-SUM in Tableau now wins over the
+  generic SUM measure that gets created for it anyway (every numeric
+  shelf field still gets a `Sum of X` measure as a fallback/default; this
+  ordering is what makes the *right* one win when more than one exists).
+- **Second, deeper bug found while verifying against the real House Sales
+  Dashboard fixture**: even after the registry fix above, `'Average House
+  Sales Price'` STILL resolved to `Sum of Price` in the actual generated
+  visual. Traced to `ds_sum_maps` (a "thin compatibility shim" dict built
+  once in `build_report_layout` and passed into ~9 separate call sites
+  across the file as `sum_map`) — every one of those call sites checks
+  `sum_map.get(col_name)` **before** ever calling
+  `_measure_registry.resolve()`, so the correctly-reordered registry was
+  never actually reached because the blanket sum measure always exists and
+  always won first. Rather than patch 9 scattered call sites (each a
+  different risk surface), fixed the shim's own construction to already
+  resolve to the correct measure per column — merging `_avg_measure_map`/
+  `_min_measure_map`/`_max_measure_map`/`_median_measure_map`/
+  `_count_measure_map` on top of `_sum_measure_map` with the same
+  most-specific-wins precedence, so every existing `sum_map.get(col)` call
+  site gets the right answer automatically, with zero call-site changes
+  and therefore minimal blast radius.
+
+**Root cause of Issue 2 (datasource caption replacing physical tables)**:
+Increment 22/32's dimension-table-splitting design (additive: keep a flat
+"fact" table + add real dimension tables + relationships) already
+correctly identifies the real physical fact table per datasource
+(`ds['_dim_split']['fact_table']`, e.g. `'Orders'`, resolved from real
+Tableau relation/metadata-records XML — see Increment 22) — but the flat
+table itself was still being **named** after the Tableau datasource
+caption (`raw_name`, e.g. `'superstore_data'`) rather than that already-
+correctly-resolved physical fact table name. The datasource caption is
+metadata describing the *container*, not a physical table, and the prompt
+explicitly named this exact confusion. (Increment 32's earlier column-leak
+filter and `_worksheet_used`/relationship-backfill work already satisfied
+the prompt's "do not recursively collect every nested physical column
+into one flat logical table" / "only expose columns actually produced by
+that table's M query" requirements — verified, not re-implemented.)
+
+**Fix (fix 2 of 2)**: `build_data_model_schema`'s per-datasource loop now
+computes `_fact_source_name = ds['_dim_split']['fact_table'] if
+ds.get('_dim_split') else raw_name` and uses it (instead of bare
+`raw_name`) for both the fact table's own PBI name and its FilePath
+parameter table's name. Every other reference that's supposed to stay
+datasource-caption-based (the `embed_sample_data` extracted-data lookup
+key, measure-name disambiguation suffixes) was deliberately left
+unchanged — confirmed by tracing each `raw_name` usage individually rather
+than a blanket rename, since the extracted-data alias
+(`extract_twbx_data`'s Step 1b/2 `ds_cap` alias, Increment 32b) is keyed
+by the datasource caption specifically and must stay that way for the
+lookup to keep working.
+
+**Verified**: `python3 -m py_compile` clean throughout. Direct fixture
+checks: `sales_dashboard`/`sales_dashboard_no_conn`/`sales_dashboard_new`
+now produce exactly `Orders`/`People`/`Returns` (previously
+`superstore_data`/`People`/`Returns`) with the same 2 correct, cardinality-
+verified relationships as Increment 32 (`Orders.Region -> People.Region`,
+`Orders.Order ID -> Returns.Order ID`) — the exact "SUPERSTORE EXPECTED
+MODEL" the prompt specified, achieved generically (no workbook-specific
+code — confirmed on a structurally different fixture too: Amazon Sales
+Insights' fact table is now `transactions`, its own real physical sub-
+table name, instead of whatever its datasource caption was). Full
+`write_pbit()` regression re-run across all 10 real fixtures in
+`source/`+`input/`: 10/10 succeed with zero exceptions, zero placeholder
+paths, zero fake-aggregation-named physical columns (scanned every
+generated fixture's TOM columns array directly), and the same independent
+dangling-visual-field-reference scan used since Increment 32 is still
+clean on every one. `House Sales Dashboard.twb`'s `'Average House Sales
+Price'`/`'Average Price Distribution By Country'`/`'Distribution of House
+Prices'` worksheets now correctly resolve to `Average of Price` in the
+final generated visual JSON (confirmed by inspecting the real written
+`Report/Layout`, not just the intermediate DAX measure list) while
+unrelated `'Grade'`-based worksheets on the same fixture correctly remain
+`Sum of Grade` — proof the fix is per-column/per-aggregation, not a
+blanket behavior change.
+
+**Not yet done / deliberately out of scope**: `STDEV`/`STDEVP`/`VAR`/
+`VARP`/`ATTR` aggregations were not implemented — no real or synthetic
+fixture exercises them, and the prompt itself warns "do not blindly map
+functions if Tableau and Power BI semantics differ," so guessing their
+DAX shape without a real sample to verify against was avoided (same
+standing project discipline as every prior increment). The
+`MeasureRegistry.resolve()` priority order (median → max → min → avg →
+count → sum) is a deterministic but not fully context-aware
+disambiguation: if the exact same physical column were used with two
+DIFFERENT explicit aggregations in two DIFFERENT worksheets of the same
+workbook (e.g. `AVG(Price)` in one chart, `MAX(Price)` in another), both
+would currently resolve to whichever kind wins the fixed priority order,
+not the aggregation that specific worksheet actually asked for — no
+current fixture exercises this exact collision (confirmed: every field
+found via `_scan_agg_fields` across all 10 fixtures uses exactly one
+explicit aggregation kind workbook-wide), so it's a flagged, unverified
+edge case rather than a fix. Threading a per-worksheet aggregation hint
+through `MeasureRegistry.resolve()`'s ~9 call sites (mirroring the
+already-present-but-unused `prefer_ctd` parameter) is the natural next
+step if a real fixture ever surfaces that collision.
+
+---
+
+### Increment 34 — Root-cause fix: Power Query duplicate-field error ("The field '...' already exists in the record")
+
+User-reported, urgent: a real Power BI refresh failure — `Orders`: "The
+field 'Region (People)' already exists in the record." — explicitly
+requested as a generic fix, not a `Region (People)`-specific patch.
+Root-caused before touching any code, and the root cause was self-
+inflicted: Increment 32c's own `_append_m_copy_columns` backfill (added
+last session to stop `Region (People)`-style relationship join-key columns
+from rendering blank charts) used `Table.AddColumn` unconditionally,
+without checking whether the target column already existed in the table
+it was appending to.
+
+**Why it already existed**: the column being backfilled (e.g.
+`Region (People)`) is kept in a table's TOM schema (`pbi_columns`) because
+some worksheet genuinely uses it, but it is NOT physically produced by
+that table's own source. The bug: `all_cols` (the column list handed to
+EVERY M-query builder — sample/CSV/Excel/generic/live — for
+`Table.TransformColumnTypes`/`RenameColumns`/the `#table(...)` schema
+declaration) was built from the SAME `dimension_cols`/`measure_cols` list
+as `pbi_columns`, so it included this column too, unconditionally. Two
+compounding symptoms, same root cause:
+1. `Table.TransformColumnTypes(Promoted, {..., {"Region (People)", type
+   text}})` — declared a source-column transform for a column the raw
+   Excel sheet doesn't have at all (file-path-parameter mode), or the
+   `#table(...)` schema declared it with a `null` placeholder value for
+   every row (embed_sample_data mode, via `_get_embedded_rows`'s existing
+   "column not found in row → emit null" fallback).
+2. Increment 32c's own `Table.AddColumn(Typed, "Region (People)", each
+   [Region])` step then tried to ADD a column of the same name — which
+   Power Query rejects outright: **"The field '...' already exists in the
+   record."** — reproduced and confirmed exactly on
+   `sales_dashboard_no_conn.twbx`'s `Orders` table before any fix.
+
+This is a real instance of the generic class of bug the user's prompt
+described (a physical column not genuinely owned by a table's source being
+treated as if it were), not a one-off `Region (People)` bug — confirmed
+generic because the fix required zero references to any specific field,
+table, or workbook name anywhere in the code path; it operates purely on
+`ds['_dim_split']['relationships']` metadata (see Increment 22/32) for
+whichever fields a given workbook happens to have.
+
+**Fix (`tableau_pbi_server.py`, `build_data_model_schema`)**:
+1. The `_fk_copy_pairs` computation (which columns need backfilling, and
+   from which fact-side column) was moved to run **before** `all_cols` is
+   built, instead of after the M-query builders had already run.
+2. `all_cols` now explicitly **excludes** every backfill-target column:
+   `all_cols = [c for c in (dimension_cols + measure_cols) if c['name']
+   not in _fk_copy_target_names]`. `pbi_columns` (the TOM declaration) is
+   unaffected — built earlier, from the unfiltered `dimension_cols`, so
+   the column is still fully declared and visual-bindable; only the
+   M-query builders' "what does this table's physical source produce"
+   list changes.
+3. `_append_m_copy_columns` now takes a defensive `existing_col_names` set
+   (the same filtered `all_cols`, passed at the call site) and **skips**
+   (never silently overwrites, never blindly renames) any copy pair whose
+   target is already present, logging a clear warning — belt-and-suspenders
+   against the same collision class from any future code path, per the
+   user's explicit "do not blindly rename/delete/ignore a duplicate"
+   instruction.
+4. Audited every other `Table.AddColumn` call site in the file (2 found:
+   this one, and the pre-existing "Month Number" real-M-column injection
+   in `_build_sample_m_query`) — the Month Number one was already safe,
+   since its target name is generated via `_unique_name(...,
+   seen_field_names, ...)` against the same collision-tracking set used
+   for every other column in the table, confirmed by direct code reading,
+   not assumed.
+
+**Verified**: `python3 -m py_compile` clean. Re-inspected
+`sales_dashboard_no_conn.twbx`'s generated `Orders` M query directly (both
+file-path-parameter mode and, via a full `write_pbit()` run, embed_sample_data
+mode): `Region (People)` no longer appears in
+`Table.TransformColumnTypes`/the `#table(...)` schema at all, and is added
+exactly once via `Table.AddColumn` at the very end — no collision possible.
+Full `write_pbit()` regression across all 10 real fixtures: 10/10 succeed
+with zero exceptions. New comprehensive scan added and run across every
+fixture's ENTIRE generated model — every table's TOM `columns` array
+checked for duplicate names, every table's M-query `#table(type table
+[...])` schema header parsed and checked for duplicate field declarations,
+every `Table.AddColumn` target checked for duplicate calls within the same
+query: **zero duplicates found anywhere**, on top of the existing
+dangling-visual-field-reference and placeholder-path scans (also still
+clean on all 10).
+
+**Relationship to the user's broader architectural requests**: several of
+the prompt's specific requirements were already satisfied by prior
+increments, confirmed rather than re-implemented this session — physical
+table ownership is already preserved (Increment 22's dimension-table
+split + Increment 33's fact-table-physical-naming: a datasource's
+physical tables are real, separate Power BI tables, not flattened into
+one); same-name-different-table fields already stay separate (each
+physical table's own column list is independently built from
+`col_table`-verified ownership, Increment 32); Tableau-disambiguated names
+(`Field (Table)`) already resolve to their real owning table via
+`col_table`/`_dim_split`, not a hardcoded parenthetical-parsing rule. The
+prompt's full ask — one single canonical field-resolution object consumed
+identically by Power Query generation, DAX, visual binding, filters,
+sorting, tooltips, hierarchies, and parameters — is not literally one
+object in this codebase; it is several purpose-built maps (`col_table`,
+`col_name_map`, `MeasureRegistry`, `_dim_split`) each covering one layer,
+consistent with "reuse existing structures" but short of a single unified
+API. Unifying those into one unbrella resolver was not attempted this
+session — the concrete, reported, reproducible bug is fixed at its true
+root cause and verified with a real duplicate-field scan across the whole
+model, not merely suppressed; a full unification is a much larger
+refactor with its own regression risk and was not requested as urgently
+as the refresh-blocking error this increment fixes.

@@ -3535,35 +3535,55 @@ def parse_tableau_workbook(path: Path) -> dict:
                 color_dim_cols.append(cleaned)
 
         # The primary category field (rows shelf first token)
-        # ── Collect ctd: (COUNT DISTINCT) referenced column base-names ─────────
-        # Tableau uses ctd:<col>:qk on shelves/encodings for COUNTD([col]).
-        # After _clean_field_name strips the prefix the col name looks the same
-        # as any plain dimension reference.  We capture the intent here by
-        # scanning column-instance elements with derivation='CountD', plus any
-        # raw shelf/encoding tokens that match the ctd: prefix pattern.
-        # This drives DISTINCTCOUNT DAX measure generation in build_data_model_schema.
+        # ── Collect explicit non-default-aggregation referenced column names ───
+        # Tableau shelf tokens carry the field's REAL chosen aggregation as a
+        # prefix (ctd:/avg:/min:/max:/med:...), and <column-instance
+        # derivation='...'> carries the same information authoritatively.
+        # Historically only ctd: (COUNT DISTINCT) was tracked this way — every
+        # other non-SUM aggregation (Average/Min/Max/Median) was silently
+        # discarded, so a Tableau field the user set to AVG or MIN ended up
+        # with a Power BI "Sum of X" measure regardless — a real aggregation-
+        # semantics bug (see measures_and_relationships_enhancement_prompt.md
+        # Issue 1: "DO NOT treat AVG(Sales) as a different physical source
+        # column" — the flip side of that same bug is silently treating it as
+        # SUM(Sales) instead of AVG(Sales), which is exactly what was
+        # happening here). Generalised the ctd: scan (3 sources: column-
+        # instance derivation, raw shelf-token prefix, pane-encoding token)
+        # into a shared helper so every Tableau aggregation gets the same
+        # treatment — not a parallel, duplicated implementation per kind.
         import re as _re_ctd_p
-        _ctd_fields_ws: set = set()   # caption-resolved base column names
-        for _dep in ws.findall('.//datasource-dependencies'):
-            for _ci in _dep.findall('column-instance'):
-                if _ci.get('derivation', '').lower() == 'countd':
-                    _base_raw = _ci.get('column', '')
-                    _cleaned_ctd = _clean_field_name(_base_raw, local_caption_map)
-                    if _cleaned_ctd:
-                        _ctd_fields_ws.add(_cleaned_ctd)
-        # Also scan shelf text and encoding attributes for raw ctd: tokens
-        for _shelf_text in (rows_txt, cols_txt):
-            for _tok in _re_ctd_p.findall(r'\[([^\[\]]+)\]', _shelf_text):
-                _mc = _re_ctd_p.match(r'^ctd:(.+?):qk$', _tok, _re_ctd_p.I)
+
+        def _scan_agg_fields(deriv_name: str, prefix: str) -> set:
+            """Column base-names explicitly using aggregation `prefix` (e.g.
+            'avg', matching Tableau's own shelf-token prefix and, in title
+            case, its <column-instance derivation=...> attribute value)."""
+            found: set = set()
+            for _dep in ws.findall('.//datasource-dependencies'):
+                for _ci in _dep.findall('column-instance'):
+                    if _ci.get('derivation', '').lower() == deriv_name.lower():
+                        _cleaned = _clean_field_name(_ci.get('column', ''), local_caption_map)
+                        if _cleaned:
+                            found.add(_cleaned)
+            for _shelf_text in (rows_txt, cols_txt):
+                for _tok in _re_ctd_p.findall(r'\[([^\[\]]+)\]', _shelf_text):
+                    _mc = _re_ctd_p.match(rf'^{prefix}:(.+?):\w+$', _tok, _re_ctd_p.I)
+                    if _mc:
+                        _cn = local_caption_map.get(_mc.group(1), _mc.group(1)).strip()
+                        if _cn: found.add(_cn)
+            for _enc in ws.findall('.//pane/encodings/'):
+                _raw_col = _enc.get('column', '')
+                _mc = _re_ctd_p.search(rf'\[{prefix}:([^\]]+):\w+\]', _raw_col, _re_ctd_p.I)
                 if _mc:
                     _cn = local_caption_map.get(_mc.group(1), _mc.group(1)).strip()
-                    if _cn: _ctd_fields_ws.add(_cn)
-        for _enc in ws.findall('.//pane/encodings/'):
-            _raw_col = _enc.get('column', '')
-            _mc = _re_ctd_p.search(r'\[ctd:([^\]]+):qk\]', _raw_col, _re_ctd_p.I)
-            if _mc:
-                _cn = local_caption_map.get(_mc.group(1), _mc.group(1)).strip()
-                if _cn: _ctd_fields_ws.add(_cn)
+                    if _cn: found.add(_cn)
+            return found
+
+        _ctd_fields_ws: set = _scan_agg_fields('countd', 'ctd')
+        _avg_fields_ws: set = _scan_agg_fields('avg', 'avg')
+        _min_fields_ws: set = _scan_agg_fields('min', 'min')
+        _max_fields_ws: set = _scan_agg_fields('max', 'max')
+        _med_fields_ws: set = _scan_agg_fields('med', 'med')
+        _cnt_fields_ws: set = _scan_agg_fields('count', 'cnt')
         _rows_first_field = _clean_field_name(
             rows_txt.strip().split('+')[0].strip() if rows_txt else '',
             local_caption_map
@@ -4542,6 +4562,11 @@ def parse_tableau_workbook(path: Path) -> dict:
             'map_location_field': map_location_field, # mapChart: geocoded location dimension
             'map_size_field':     map_size_field,     # mapChart: bubble-size measure
             'ctd_fields':         list(_ctd_fields_ws), # columns used with COUNT DISTINCT (ctd:)
+            'avg_fields':         list(_avg_fields_ws), # columns used with AVERAGE (avg:)
+            'min_fields':         list(_min_fields_ws), # columns used with MIN (min:)
+            'max_fields':         list(_max_fields_ws), # columns used with MAX (max:)
+            'med_fields':         list(_med_fields_ws), # columns used with MEDIAN (med:)
+            'cnt_fields':         list(_cnt_fields_ws), # columns used with COUNT (cnt:)
         })
 
     # ── Extract embedded data from .hyper if this is a .twbx ─────────────────
@@ -5211,6 +5236,76 @@ def _m_rename_columns(columns: list) -> str:
     if not pairs:
         return ''
     return '{' + ', '.join(pairs) + '}'
+
+
+def _append_m_copy_columns(m_query: str, copies: list,
+                            existing_col_names: 'set | None' = None) -> str:
+    """Append Table.AddColumn steps that populate one column as a straight
+    same-row copy of another column already produced by this same M query.
+
+    Used to backfill a relationship's own dimension-side join-key column
+    (e.g. Tableau's 'Region (People)', kept on the flat/fact table because a
+    worksheet genuinely uses it — see build_data_model_schema's
+    _worksheet_used guard) with its guaranteed-equal fact-side counterpart.
+    The join's own equality condition (e.g. Orders.Region = People.Region)
+    means the two values are identical for every row where the relationship
+    holds, so a real cross-table join isn't needed to populate it — a plain
+    per-row copy is both correct and far lower-risk than retrofitting a join
+    into every M-query builder this file has (sample/CSV/Excel/generic/live).
+
+    Without this, such a column is declared in the TOM schema but every row
+    evaluates to NULL (the embed path) or Power BI can't resolve it at all
+    (the file-path-parameter path) — either way, any visual using it renders
+    completely blank. copies: [(target_col_name, source_col_name), ...],
+    both already-final PBI column names within THIS table.
+
+    existing_col_names: the set of column names the table ALREADY has
+    (typically the same `all_cols` list passed to whichever M-query builder
+    produced `m_query`). Callers should already have excluded these target
+    columns from that list — see build_data_model_schema's _fk_copy_pairs /
+    all_cols filtering — so this is a defensive second check, not the
+    primary guarantee: Table.AddColumn errors with "The field '...' already
+    exists in the record" if the column is already present, which is
+    exactly the generic Power Query duplicate-field failure mode this
+    function must never produce. A colliding pair is skipped (never
+    silently overwritten, never blindly renamed) and logged, matching this
+    project's "surface the gap, don't paper over it" discipline.
+
+    Every M-query builder in this file ends with the exact same two-line
+    trailer ("in" then "    <FinalStepName>") — if that shape isn't found
+    (an M query this function doesn't recognise), the input is returned
+    unchanged rather than risk corrupting it.
+    """
+    if not copies:
+        return m_query
+    lines = m_query.split('\n')
+    if len(lines) < 2 or lines[-2].strip() != 'in':
+        return m_query
+    final_step = lines[-1].strip()
+    body = lines[:-2]
+    prev = final_step
+    import re as _re_fkc
+    _existing = set(existing_col_names or ())
+    add_lines = []
+    for i, (tgt, src) in enumerate(copies):
+        if tgt == src:
+            continue
+        if tgt in _existing:
+            log('warn', f"[M-Query] Skipped backfilling {tgt!r} from {src!r} — "
+                f"a column named {tgt!r} already exists in this table's own "
+                f"source columns; adding it again would produce a duplicate "
+                f"Power Query field.")
+            continue
+        step_name = f'_FkCopy{i}_' + _re_fkc.sub(r'\W', '_', tgt)[:20]
+        add_lines.append(
+            f'    ,{step_name} = Table.AddColumn({prev}, "{_m_str(tgt)}", '
+            f'each [{src}])'
+        )
+        _existing.add(tgt)
+        prev = step_name
+    if not add_lines:
+        return m_query
+    return '\n'.join(body + add_lines + ['in', f'    {prev}'])
 
 
 def _m_col_name_type(col_name: str, col_datatype: str) -> str:
@@ -11029,7 +11124,20 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
         if not visible_cols and not ds.get('calculations'):
             continue
 
-        table_name = _unique_name(_safe_pbi_name(raw_name), seen_table_names)
+        # ── Physical fact table naming (measures_and_relationships_
+        # enhancement_prompt.md Issue 2) ────────────────────────────────────
+        # A Tableau datasource caption (e.g. 'superstore_data') is metadata
+        # describing the datasource/container — it is NOT itself a physical
+        # table, and must not replace the real physical table name when this
+        # datasource actually has one (_dim_split's fact_table, e.g.
+        # 'Orders' — resolved at parse time from the same Tableau relation/
+        # metadata-records XML the dimension-table split already uses, never
+        # guessed). Without this, the model showed 'superstore_data' +
+        # 'People' + 'Returns' instead of the expected 'Orders' + 'People' +
+        # 'Returns' — the datasource caption standing in for the fact table
+        # it was never meant to replace.
+        _fact_source_name = ds['_dim_split']['fact_table'] if ds.get('_dim_split') else raw_name
+        table_name = _unique_name(_safe_pbi_name(_fact_source_name), seen_table_names)
         conn = ds['connection']
         conn_class = conn.get('class', '').lower()
 
@@ -11044,7 +11152,7 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
         # ── Parameter table for file path (file-backed connections only) ───
         # param_name also goes into seen_table_names because TOM checks
         # uniqueness across the entire tables collection.
-        param_name = _unique_name(_safe_pbi_name(raw_name + "FilePath"), seen_table_names)
+        param_name = _unique_name(_safe_pbi_name(_fact_source_name + "FilePath"), seen_table_names)
         if not embed_sample_data and not is_live_connection:
             param_table = {
                 "name": param_name,
@@ -12142,48 +12250,62 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
                     "formatString": "#,##0"
                 })
 
-        # ── Auto-generate DISTINCTCOUNT measures for ctd: shelf tokens ────────
-        # Tableau uses ctd:<ColName>:qk on chart shelves for COUNT DISTINCT of a
-        # dimension column (COUNTD() in Tableau).  The column is role='dimension'
-        # so it does not appear in measure_cols and gets no SUM measure.
-        # We scan worksheets for any ctd_fields entry (set in parse_tableau_workbook
-        # from column-instance derivation='CountD' attributes) and generate a
-        # dedicated DISTINCTCOUNT DAX measure for each referenced column.
-        # The measure name is stored in ds['_ctd_measure_map'] so build_report_layout
-        # can resolve ctd: Y-axis and Color roles without knowing the DAX measure name.
-        _ctd_measure_map: dict = {}   # col_caption → 'Count Distinct of col_caption'
-        _all_ctd_fields: set = set()
-        for _ws_inf2 in workbook.get('worksheets', []):
-            _ws_ds2 = _ws_inf2.get('ds_names', [])
-            if (raw_name          not in _ws_ds2
-                    and ds.get('name','')     not in _ws_ds2
-                    and ds.get('raw_name','') not in _ws_ds2):
-                continue
-            for _cf2 in _ws_inf2.get('ctd_fields', []):
-                _all_ctd_fields.add(_cf2.strip().lower().replace(' ','').replace('-',''))
+        # ── Auto-generate measures for explicit non-default aggregations ─────
+        # Tableau shelf tokens (ctd:/avg:/min:/max:/med:<ColName>:qk) carry
+        # the field's REAL chosen aggregation. Historically only ctd: (COUNT
+        # DISTINCT) got a dedicated measure here — every other explicit
+        # non-SUM aggregation was silently dropped, so a field the Tableau
+        # user set to AVG/MIN/MAX/MEDIAN ended up rendered with a Power BI
+        # "Sum of X" measure regardless of what was actually selected (see
+        # measures_and_relationships_enhancement_prompt.md Issue 1). We scan
+        # worksheets for each *_fields entry (set in parse_tableau_workbook
+        # from column-instance derivation attributes / shelf-token prefixes)
+        # and generate the matching dedicated DAX measure for each kind.
+        # Measure names are stored in ds['_<kind>_measure_map'] so
+        # build_report_layout can resolve each role without knowing the DAX
+        # measure name. Shared helper (was duplicated per-kind before this
+        # generalisation) — one implementation, not four parallel copies.
+        def _build_explicit_agg_measures(ws_field_key: str, dax_fn: str,
+                                          display_prefix: str) -> dict:
+            _measure_map: dict = {}
+            _all_fields: set = set()
+            for _ws_inf2 in workbook.get('worksheets', []):
+                _ws_ds2 = _ws_inf2.get('ds_names', [])
+                if (raw_name          not in _ws_ds2
+                        and ds.get('name','')     not in _ws_ds2
+                        and ds.get('raw_name','') not in _ws_ds2):
+                    continue
+                for _cf2 in _ws_inf2.get(ws_field_key, []):
+                    _all_fields.add(_cf2.strip().lower().replace(' ','').replace('-',''))
+            for _col2 in dimension_cols + measure_cols:
+                if _col2.get('hidden'): continue
+                _cn2 = _col2['name'].strip().lower().replace(' ','').replace('-','')
+                _sn2 = (_col2.get('source_name') or _col2['name']).strip().lower()\
+                            .replace(' ','').replace('-','')
+                if _cn2 not in _all_fields and _sn2 not in _all_fields:
+                    continue
+                _dc_msr_name2 = f"{display_prefix} of {_col2['name']}"
+                if _dc_msr_name2.lower() in seen_field_names:
+                    _measure_map[_col2['name']] = _dc_msr_name2
+                    continue
+                _dc_reg2 = _unique_name(_dc_msr_name2, seen_field_names, case_insensitive=True)
+                _pbi_col_name2 = col_name_map.get(_col2['name'], _col2['name'])
+                pbi_measures.append({
+                    "name": _dc_reg2,
+                    "lineageTag": _guid(),
+                    "expression": f"{dax_fn}('{table_name}'[{_pbi_col_name2}])",
+                    "formatString": "#,##0" if dax_fn == 'DISTINCTCOUNT' else "General Number"
+                })
+                _measure_map[_col2['name']] = _dc_reg2
+            return _measure_map
 
-        for _col2 in dimension_cols + measure_cols:
-            if _col2.get('hidden'): continue
-            _cn2 = _col2['name'].strip().lower().replace(' ','').replace('-','')
-            _sn2 = (_col2.get('source_name') or _col2['name']).strip().lower()\
-                        .replace(' ','').replace('-','')
-            if _cn2 not in _all_ctd_fields and _sn2 not in _all_ctd_fields:
-                continue
-            _dc_msr_name2 = f"Count Distinct of {_col2['name']}"
-            if _dc_msr_name2.lower() in seen_field_names:
-                _ctd_measure_map[_col2['name']] = _dc_msr_name2
-                continue
-            _dc_reg2 = _unique_name(_dc_msr_name2, seen_field_names, case_insensitive=True)
-            _pbi_col_name2 = col_name_map.get(_col2['name'], _col2['name'])
-            pbi_measures.append({
-                "name": _dc_reg2,
-                "lineageTag": _guid(),
-                "expression": f"DISTINCTCOUNT('{table_name}'[{_pbi_col_name2}])",
-                "formatString": "#,##0"
-            })
-            _ctd_measure_map[_col2['name']] = _dc_reg2
-
-        ds['_ctd_measure_map'] = _ctd_measure_map
+        _ctd_measure_map = _build_explicit_agg_measures('ctd_fields', 'DISTINCTCOUNT', 'Count Distinct')
+        ds['_ctd_measure_map']    = _ctd_measure_map
+        ds['_avg_measure_map']    = _build_explicit_agg_measures('avg_fields', 'AVERAGE', 'Average')
+        ds['_min_measure_map']    = _build_explicit_agg_measures('min_fields', 'MIN', 'Min')
+        ds['_max_measure_map']    = _build_explicit_agg_measures('max_fields', 'MAX', 'Max')
+        ds['_median_measure_map'] = _build_explicit_agg_measures('med_fields', 'MEDIAN', 'Median')
+        ds['_count_measure_map']  = _build_explicit_agg_measures('cnt_fields', 'COUNT', 'Count')
 
         # Fallback: promote numeric columns to implicit SUM measures only when
         # there are no explicit calculations AND the name is not already taken.
@@ -12300,7 +12422,45 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
                       or ds.get('name', '')
                       or conn.get('dbname', '')
                       or table_name)
-        all_cols = dimension_cols + measure_cols
+        # ── Identify worksheet-used relationship join-key columns that need
+        # backfilling — computed BEFORE all_cols so these columns can be
+        # EXCLUDED from the physical-source column list handed to the
+        # M-query builders below. A column like 'Region (People)' is kept in
+        # this table's TOM schema (pbi_columns, built earlier) because some
+        # worksheet genuinely uses it, but it is NOT physically produced by
+        # this table's own source (Orders' sheet has no such column) — its
+        # value is backfilled after the fact from the relationship's
+        # equality condition (Orders.Region = People.Region). Treating it as
+        # a real source column here was the actual root cause of two
+        # symptoms that are really the same bug: Table.TransformColumnTypes/
+        # RenameColumns referencing a column the raw source doesn't have,
+        # and — once a placeholder existed anyway (the embed_sample_data
+        # path's #table schema, or Increment 32c's own earlier version of
+        # this fix) — the later backfill Table.AddColumn step colliding with
+        # it ("The field 'Region (People)' already exists in the record.").
+        # Excluding it here and adding it via Table.AddColumn afterward
+        # (see _fk_copy_pairs below) means it is added exactly once, to a
+        # table that genuinely does not already have it — no collision
+        # possible regardless of which M-query builder produced the table.
+        _fk_copy_pairs = []
+        if ds.get('_dim_split'):
+            for c in dimension_cols:
+                if not c.get('_worksheet_used'):
+                    continue
+                _raw_key = c.get('source_name') or c['name']
+                _match_rel = next(
+                    (r for r in ds['_dim_split']['relationships']
+                     if r['toColumn'] == _raw_key), None)
+                if not _match_rel:
+                    continue
+                _src_final = col_name_map.get(_match_rel['fromColumn'])
+                _tgt_final = col_name_map.get(c['name'], c['name'])
+                if _src_final and _src_final != _tgt_final:
+                    _fk_copy_pairs.append((_tgt_final, _src_final))
+        _fk_copy_target_names = {_t for _t, _s in _fk_copy_pairs}
+
+        all_cols = [c for c in (dimension_cols + measure_cols)
+                    if c['name'] not in _fk_copy_target_names]
 
         if ds.get('_join_tree') and not embed_sample_data:
             # ── Physical join-tree datasource (classic <relation type='join'>) ──
@@ -12380,6 +12540,20 @@ def build_data_model_schema(workbook: dict, filename: str = "", embed_sample_dat
                 f"extractable data — generated with an empty data source. "
                 f"See migration_audit.md for detail.")
             _audit.record_unsupported_datasource(table_name, conn_class, raw_name)
+
+        # ── Backfill worksheet-used relationship join-key columns ───────────
+        # _fk_copy_pairs was computed above (before all_cols) precisely so
+        # these target columns are guaranteed absent from the table built by
+        # the M-query builders above — Table.AddColumn here can never
+        # collide with an existing field of the same name.
+        if _fk_copy_pairs:
+            m_query = _append_m_copy_columns(
+                m_query, _fk_copy_pairs,
+                existing_col_names={c['name'] for c in all_cols})
+            log('info', f"  ↳ '{table_name}': backfilled "
+                f"{len(_fk_copy_pairs)} worksheet-used relationship "
+                f"join-key column(s) from their fact-side counterpart: "
+                + ', '.join(f'{t!r}<-{s!r}' for t, s in _fk_copy_pairs))
 
         # ── Build PBI hierarchies from Tableau <drill-path> definitions ─────
         # Each Tableau drill-path becomes a PBI TOM hierarchy with one level
@@ -15273,20 +15447,42 @@ class MeasureRegistry:
     ----------------
     1. Named DAX calc that is itself an aggregate measure
     2. Count-distinct measure (_ctd_measure_map)
-    3. Sum-of-column measure (_sum_measure_map)
+    3. Median/Max/Min/Average measure (_median_/_max_/_min_/_avg_measure_map)
+       — explicit non-default Tableau aggregations (see
+       measures_and_relationships_enhancement_prompt.md Issue 1); checked
+       before the SUM fallback so a field the user explicitly set to
+       AVG/MIN/MAX/MEDIAN in Tableau doesn't silently render as SUM just
+       because it also happens to appear on some Rows/Columns shelf
+       (chart_y_col_names in build_data_model_schema creates a SUM measure
+       for any numeric shelf field regardless of its real aggregation).
+    4. Sum-of-column measure (_sum_measure_map) — the default/fallback
     Returns None when no pre-built measure exists (scatter Aggregation path).
     """
+
+    # (ds attribute key, registry dict name, priority — checked in this order
+    # right after ctd, before the sum fallback)
+    _EXPLICIT_AGG_KINDS = (
+        ('_median_measure_map', '_median'),
+        ('_max_measure_map',    '_max'),
+        ('_min_measure_map',    '_min'),
+        ('_avg_measure_map',    '_avg'),
+        ('_count_measure_map',  '_count'),
+    )
 
     def __init__(self, datasources: list):
         self._sum:  dict = {}   # ds_name → {nk(col) → measure_name}
         self._ctd:  dict = {}   # ds_name → {nk(col_cap) → ctd_measure_name}
         self._calc: dict = {}   # ds_name → {nk(name) → calc_dict}
+        for _, attr in self._EXPLICIT_AGG_KINDS:
+            setattr(self, attr, {})
 
         for ds in datasources:
             dsn = ds.get('name', '')
             self._sum[dsn]  = {}
             self._ctd[dsn]  = {}
             self._calc[dsn] = {}
+            for _, attr in self._EXPLICIT_AGG_KINDS:
+                getattr(self, attr)[dsn] = {}
 
             for col_name, msr_name in ds.get('_sum_measure_map', {}).items():
                 k = self._nk(col_name)
@@ -15297,6 +15493,13 @@ class MeasureRegistry:
                 k = self._nk(col_cap)
                 self._ctd[dsn][k] = ctd_name
                 self._ctd[dsn][self._nk(ctd_name)] = ctd_name   # self-key
+
+            for ds_key, attr in self._EXPLICIT_AGG_KINDS:
+                _reg = getattr(self, attr)
+                for col_cap, msr_name in ds.get(ds_key, {}).items():
+                    k = self._nk(col_cap)
+                    _reg[dsn][k] = msr_name
+                    _reg[dsn][self._nk(msr_name)] = msr_name   # self-key
 
             for calc in ds.get('calculations', []):
                 if not calc.get('is_agg_calc', True):
@@ -15330,7 +15533,16 @@ class MeasureRegistry:
             return {'name': ctd_name, 'is_measure': True, 'is_agg': False,
                     'datatype': 'double'}
 
-        # 3. Sum-of-column
+        # 3. Explicit non-default aggregation (Median/Max/Min/Average) —
+        # checked before the SUM fallback so a field the Tableau user
+        # explicitly aggregated as e.g. AVG doesn't silently render as SUM.
+        for _, attr in self._EXPLICIT_AGG_KINDS:
+            _msr_name = getattr(self, attr).get(dsn, {}).get(key)
+            if _msr_name:
+                return {'name': _msr_name, 'is_measure': True, 'is_agg': False,
+                        'datatype': 'double'}
+
+        # 4. Sum-of-column (default/fallback)
         msr_name = self._sum.get(dsn, {}).get(key)
         if msr_name:
             return {'name': msr_name, 'is_measure': True, 'is_agg': False,
@@ -15658,13 +15870,37 @@ def build_report_layout(workbook: dict) -> dict:
     _measure_registry = MeasureRegistry(datasources)
 
     # Thin compatibility shim: older code paths index ds_sum_maps[ds_name][col]
-    # directly. Populate from the authoritative map; fall back to re-derivation
-    # only when the schema builder has not yet run (e.g. unit tests).
+    # directly, checking it BEFORE consulting _measure_registry (see e.g. the
+    # 'sum_map.get(...)' checks throughout build_report_layout) — a field
+    # gets a "Sum of X" measure created for it by build_data_model_schema's
+    # blanket chart_y_col_names pass whenever it appears on ANY row/column
+    # shelf, REGARDLESS of the aggregation the user actually chose in
+    # Tableau, so that plain sum_map lookup was silently winning over the
+    # correct AVG/MIN/MAX/MEDIAN measure even after MeasureRegistry.resolve()
+    # was taught to prefer them (see measures_and_relationships_enhancement_
+    # prompt.md Issue 1 — this was the actual chokepoint, confirmed real via
+    # input/House Sales Dashboard.twb's 'Average House Sales Price'
+    # worksheet still resolving to 'Sum of Price' despite the registry fix).
+    # Fixed by making this compatibility dict itself resolve to the CORRECT
+    # measure per column — every caller that blindly does sum_map.get(col)
+    # now gets the right answer without having to touch each call site
+    # individually. Populate from the authoritative maps; fall back to
+    # re-derivation only when the schema builder has not yet run (e.g. unit
+    # tests, which never populate columns with a non-default aggregation).
     ds_sum_maps: dict = {}
     for ds in datasources:
         _authoritative = ds.get('_sum_measure_map', {})
         if _authoritative:
-            ds_sum_maps[ds['name']] = dict(_authoritative)
+            _merged = dict(_authoritative)
+            # Later maps override earlier ones — least to most specific,
+            # matching MeasureRegistry.resolve()'s own priority order (sum
+            # is the generic default; an explicit non-default aggregation on
+            # the SAME column is always the more intentional signal).
+            for _agg_map_key in ('_avg_measure_map', '_min_measure_map',
+                                  '_max_measure_map', '_median_measure_map',
+                                  '_count_measure_map'):
+                _merged.update(ds.get(_agg_map_key, {}))
+            ds_sum_maps[ds['name']] = _merged
         else:
             # Schema builder hasn't run yet — re-derive as before
             _measure_cols = [c for c in ds.get('columns', [])
